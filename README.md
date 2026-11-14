@@ -98,3 +98,13 @@ cargo test python_zipfile_can_decrypt_generated_archive -- --ignored
 MIT 许可证覆盖 Rust 项目，保留原接入代码的授权声明。Docker 中 FFmpeg 的源码版本、校验摘要及编译参数可在 Dockerfile 查阅，其源码提供于 FFmpeg 官方发布目录。[FFmpeg 源码](https://ffmpeg.org/releases/)
 
 生产环境的目录、服务和验证结果见 [生产部署](docs/PRODUCTION.md)。
+
+## 图集输出
+
+图集会将文字与本次图片合成一条 Markdown 消息，默认最多 9 张。程序读取 PNG、JPEG、GIF、WebP 的实际编码元信息及 EXIF 方向，按宽度最多 750 像素等比声明显示尺寸。源图逐个下载、上传，内存中的单张图片上限为 20 MiB。
+
+上传后检查中转图链及其显示尺寸。64 KiB 前缀不能确认后置方向信息时，在同一大小限制内补取完整中转文件。渲染不进行像素解码或重编码。中转地址仅用于当前回复，仍受平台图链有效期和 QQ 客户端缓存影响。
+
+Markdown 开启图片转存结果校验。QQ 明确返回图片转存错误时，最多再用一次原站图链发送整篇图文。最终失败会显示未发送的图片数量，准备失败和配置截断也会在图文中标明。手机与 PC 的最终显示效果需要实际客户端验证。
+
+尺寸和消息格式参考官方 SDK，转存失败分类参考实际开源联调记录。[官方尺寸实现](https://github.com/tencent-connect/qqbot-nodejs/blob/main/src/protocol/utils/image-size.ts) [官方图片行为](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/type/markdown.md) [El Bot 转存实测](https://docs.bot.elpsy.cn/development/codex-remote.html) [多图 Markdown 示例](https://github.com/Teahouse-Studios/qq-botpy-sdk/blob/master/examples/demo_group_reply_markdown_image.py)

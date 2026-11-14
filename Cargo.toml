@@ -1,6 +1,6 @@
 [package]
 name = "videorust"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Rust 原站视频图集解析与 QQ 官方机器人"
 license = "MIT"
@@ -13,6 +13,8 @@ html-escape = "0.2"
 cookie = "0.18"
 qrcode = { version = "0.14", default-features = false }
 png = "0.18"
+imagesize = { version = "0.15", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+kamadak-exif = "0.6"
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 hex = "0.4"

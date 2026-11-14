@@ -40,7 +40,7 @@ pub fn media_payload(file_info: impl Into<String>) -> Value {
 pub fn markdown_image_tag(url: &str, size: Option<&ImageSize>) -> String {
     let width = size.map_or(750, |size| size.width.max(1));
     let height = size.map_or(1000, |size| size.height.max(1));
-    format!("![img#{width}px #{height}px]({url})")
+    format!("![#{width}px #{height}px]({url})")
 }
 
 pub struct MarkdownOptions {
@@ -440,8 +440,8 @@ mod tests {
                 max_images: 2,
             },
         );
-        assert!(markdown.contains("![img#1366px #2048px](https://a/1.jpg)"));
-        assert!(markdown.contains("![img#750px #1000px](https://a/2.jpg)"));
+        assert!(markdown.contains("![#1366px #2048px](https://a/1.jpg)"));
+        assert!(markdown.contains("![#750px #1000px](https://a/2.jpg)"));
         assert!(markdown.contains("其余 1 张"));
     }
 }

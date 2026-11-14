@@ -4,6 +4,7 @@ pub mod channels;
 pub mod formatter;
 pub mod gpt_detect;
 pub mod http;
+pub mod image_dimensions;
 pub mod jmcomic;
 pub mod matcher;
 pub mod media;
