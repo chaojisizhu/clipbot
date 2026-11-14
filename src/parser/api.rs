@@ -55,6 +55,8 @@ pub struct VideoParserService {
     cache: Mutex<HashMap<String, CacheEntry>>,
     // Fixed lock stripes coalesce concurrent requests without growing a pending-key map.
     key_locks: [AsyncMutex<()>; 64],
+    // The mutex serializes authenticated X extraction; its value is a rate-limit cooldown.
+    twitter_auth_gate: AsyncMutex<Instant>,
 }
 
 impl VideoParserService {
@@ -65,6 +67,7 @@ impl VideoParserService {
             config,
             cache: Mutex::new(HashMap::new()),
             key_locks: std::array::from_fn(|_| AsyncMutex::new(())),
+            twitter_auth_gate: AsyncMutex::new(Instant::now()),
         })
     }
 
@@ -206,6 +209,13 @@ impl VideoParserService {
             return download_jm_album(&capture[2], &capture[1] == "photo", &self.config.jmcomic)
                 .await;
         }
+        if platform == "twitter"
+            && let Some(cookie_file) = authenticated_twitter_cookie_file(&self.config)
+        {
+            return self
+                .parse_twitter_authenticated(&clean_url(url), cookie_file)
+                .await;
+        }
         let resolved = if is_short_link(url) {
             self.http.resolve_url(url, platform).await?
         } else {
@@ -268,6 +278,74 @@ impl VideoParserService {
             Err(error) => Err(error),
         }
     }
+
+    async fn parse_twitter_authenticated(
+        &self,
+        url: &str,
+        cookie_file: &str,
+    ) -> Result<ParsedData> {
+        let mut blocked_until = self.twitter_auth_gate.lock().await;
+        let now = Instant::now();
+        if *blocked_until > now {
+            bail!(
+                "X 登录态请求处于限流冷却期，请在 {} 秒后重试",
+                blocked_until
+                    .duration_since(now)
+                    .as_secs()
+                    .saturating_add(1)
+            );
+        }
+        let result = twitter::parse_ytdlp(url, &self.config.ytdlp, Some(cookie_file)).await;
+        if let Err(error) = &result {
+            let message = error.to_string().to_ascii_lowercase();
+            if message
+                .split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|part| part == "429")
+                || ["rate-limit", "rate limit", "too many requests"]
+                    .iter()
+                    .any(|marker| message.contains(marker))
+            {
+                *blocked_until = Instant::now()
+                    + Duration::from_secs(self.config.api.rate_limit_cooldown.clamp(1, 3600));
+            }
+            if is_twitter_photo_fallback(&message) {
+                return twitter::parse_native(&self.http, url)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("X 公开图片提取失败。{error}"));
+            }
+        }
+        result.map_err(|error| {
+            anyhow::anyhow!("X 登录态解析失败，请检查 Cookie 和作品访问权限。{error}")
+        })
+    }
+}
+
+fn is_twitter_photo_fallback(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    let denied_http_status = message
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| ["401", "403", "429"].contains(&part));
+    message.contains("no video could be found in this tweet")
+        && !denied_http_status
+        && !["not authorized", "login", "log in", "expired", "cookie"]
+            .iter()
+            .any(|marker| message.contains(marker))
+}
+
+fn authenticated_twitter_cookie_file(config: &AppConfig) -> Option<&str> {
+    if !config.ytdlp.enabled {
+        return None;
+    }
+    config
+        .auth
+        .cookie_files
+        .get("twitter")
+        .map(String::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .or_else(|| {
+            (!config.ytdlp.cookie_file.trim().is_empty())
+                .then_some(config.ytdlp.cookie_file.as_str())
+        })
 }
 
 fn is_short_link(raw: &str) -> bool {
@@ -295,6 +373,129 @@ fn is_short_link(raw: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticated_twitter_selects_platform_cookie_file_and_honors_disable() {
+        let mut config = AppConfig::default();
+        config.ytdlp.enabled = true;
+        config.ytdlp.cookie_file = "global.txt".into();
+        config
+            .auth
+            .cookie_files
+            .insert("twitter".into(), "platform.txt".into());
+        assert_eq!(
+            authenticated_twitter_cookie_file(&config),
+            Some("platform.txt")
+        );
+        config
+            .auth
+            .cookie_files
+            .insert("twitter".into(), "  ".into());
+        assert_eq!(
+            authenticated_twitter_cookie_file(&config),
+            Some("global.txt")
+        );
+        config.ytdlp.enabled = false;
+        assert!(authenticated_twitter_cookie_file(&config).is_none());
+    }
+
+    #[test]
+    fn public_photo_fallback_excludes_authentication_and_rate_limit_failures() {
+        let no_video = "ERROR: [twitter] 123: No video could be found in this tweet";
+        assert!(is_twitter_photo_fallback(no_video));
+        assert!(is_twitter_photo_fallback(
+            "ERROR: [twitter] 123429403401789: No video could be found in this tweet"
+        ));
+        for suffix in [
+            "HTTP 401",
+            "HTTP 403",
+            "HTTP 429",
+            "Not authorized",
+            "Login required",
+            "Cookie expired",
+        ] {
+            assert!(!is_twitter_photo_fallback(&format!("{no_video}; {suffix}")));
+        }
+        assert!(!is_twitter_photo_fallback(
+            "Requested format is not available"
+        ));
+    }
+
+    #[cfg(unix)]
+    fn authenticated_twitter_fixture(directory: &std::path::Path, body: &str) -> AppConfig {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cookies = directory.join("twitter fixture.txt");
+        std::fs::write(
+            &cookies,
+            "# Netscape HTTP Cookie File\n.x.com\tTRUE\t/\tTRUE\t0\tauth_token\tfixture-value\n",
+        )
+        .unwrap();
+        let executable = directory.join("local-extractor.sh");
+        std::fs::write(&executable, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = AppConfig::default();
+        config.ytdlp.enabled = true;
+        config.ytdlp.command = executable.to_string_lossy().into_owned();
+        config.ytdlp.timeout = 2000;
+        config
+            .auth
+            .cookie_files
+            .insert("twitter".into(), cookies.to_string_lossy().into_owned());
+        config
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_twitter_uses_local_cookie_route_despite_native_cooldown() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = authenticated_twitter_fixture(
+            directory.path(),
+            r#"cookie_file=
+previous=
+for arg; do
+  if [ "$previous" = --cookies ]; then cookie_file=$arg; fi
+  previous=$arg
+done
+test -r "$cookie_file" || exit 31
+printf '%s\n' '{"id":"123","title":"fixture","ext":"mp4","vcodec":"h264","acodec":"aac","url":"https://video.twimg.com/fixture.mp4"}'"#,
+        );
+        let parser = VideoParserService::new(config).unwrap();
+        parser.http.cool_down("twitter").await;
+        let data = parser
+            .parse_url("https://x.com/example/status/123", "twitter")
+            .await
+            .success()
+            .expect("authenticated extraction must bypass the blocked anonymous endpoint");
+        assert_eq!(data.title, "fixture");
+        assert_eq!(data.video, "https://video.twimg.com/fixture.mp4");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_twitter_rate_limit_stops_subsequent_local_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = authenticated_twitter_fixture(
+            directory.path(),
+            r#"printf 'run' >> "$(dirname "$0")/calls"
+printf '%s\n' 'HTTP Error 429: Too Many Requests' >&2
+exit 1"#,
+        );
+        let parser = VideoParserService::new(config).unwrap();
+        parser.http.cool_down("twitter").await;
+        let first = parser
+            .parse_url("https://x.com/example/status/123", "twitter")
+            .await;
+        assert!(first.failure_message().unwrap().contains("429"));
+        let second = parser
+            .parse_url("https://x.com/example/status/456", "twitter")
+            .await;
+        assert!(second.failure_message().unwrap().contains("限流冷却"));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "run"
+        );
+    }
 
     #[tokio::test]
     async fn cache_is_bounded_and_expires() {

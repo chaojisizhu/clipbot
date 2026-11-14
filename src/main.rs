@@ -30,7 +30,7 @@ async fn run() -> Result<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "AllVideo Rust\n\n用法\n  videorust [--config config.yaml] bot\n  videorust [--config config.yaml] parse <分享链接>...\n  videorust [--config config.yaml] probe <分享链接>\n  videorust [--config config.yaml] check\n\nparse 输出 JSON。probe 解析并流式下载校验，随后清理文件。默认命令为 bot。"
+            "AllVideo Rust\n\n用法\n  videorust [--config config.yaml] bot\n  videorust [--config config.yaml] parse <分享链接>...\n  videorust [--config config.yaml] probe <分享链接>\n  videorust [--config config.yaml] check\n  videorust [--config config.yaml] login bilibili [--cookie-file 路径] [--qr-file 路径] [--timeout-seconds 180]\n\nparse 输出 JSON。probe 解析并流式下载校验，随后清理文件。默认命令为 bot。"
         );
         return Ok(());
     }
@@ -58,6 +58,9 @@ async fn run() -> Result<()> {
         .with_writer(std::io::stderr)
         .try_init();
     let command = args.first().map(String::as_str).unwrap_or("bot");
+    if command == "login" {
+        return run_login(&config, &args[1..]).await;
+    }
     let parser = Arc::new(VideoParserService::new(config.clone())?);
     match command {
         "check" => {
@@ -121,6 +124,69 @@ async fn run() -> Result<()> {
         "bot" => run_bot(config, parser).await,
         _ => bail!("未知命令 {command}，使用 --help 查看用法"),
     }
+}
+
+async fn run_login(config: &AppConfig, args: &[String]) -> Result<()> {
+    use videorust::auth::bilibili::{LoginOptions, login};
+
+    if args.first().map(String::as_str) != Some("bilibili") {
+        bail!("扫码登录当前支持 bilibili，使用 login bilibili 启动");
+    }
+    let mut cookie_file = config
+        .auth
+        .cookie_files
+        .get("bilibili")
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cookies/bilibili.txt"));
+    let mut qr_file = PathBuf::from("cookies/bilibili-login.png");
+    let mut timeout = Duration::from_secs(180);
+    let (options, remainder) = args[1..].as_chunks::<2>();
+    for pair in options {
+        match pair[0].as_str() {
+            "--cookie-file" => cookie_file = PathBuf::from(&pair[1]),
+            "--qr-file" => qr_file = PathBuf::from(&pair[1]),
+            "--timeout-seconds" => {
+                let seconds: u64 = pair[1].parse().context("登录等待秒数必须为正整数")?;
+                if seconds == 0 {
+                    bail!("登录等待秒数必须大于零");
+                }
+                timeout = Duration::from_secs(seconds.min(600));
+            }
+            other => bail!("未知登录选项 {other}"),
+        }
+    }
+    if let Some(option) = remainder.first() {
+        bail!("登录选项 {option} 缺少值");
+    }
+    let outcome = login(LoginOptions {
+        cookie_file,
+        qr_file,
+        timeout,
+        proxy: config.api.proxy.clone(),
+    })
+    .await?;
+    if config
+        .auth
+        .cookies
+        .get("bilibili")
+        .is_some_and(|cookie| !cookie.trim().is_empty())
+    {
+        eprintln!(
+            "新 Cookie 已保存。请清空旧的 auth.cookies.bilibili，并将 auth.cookieFiles.bilibili 设为 {} 后重启。",
+            outcome.cookie_file.display()
+        );
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "status":"success", "platform":"bilibili",
+            "cookieFile": outcome.cookie_file,
+            "verified": outcome.verified,
+            "message": outcome.verification_message,
+        })
+    );
+    Ok(())
 }
 
 async fn run_bot(config: AppConfig, parser: Arc<VideoParserService>) -> Result<()> {

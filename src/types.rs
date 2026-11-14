@@ -308,6 +308,9 @@ impl Default for AppConfig {
         ] {
             platform_enable.insert(name.into(), true);
         }
+        for name in ["weibo", "youtube", "zhihu"] {
+            platform_enable.insert(name.into(), false);
+        }
         Self {
             qqbot: QQBotConfig::default(),
             ui_text: UiTextConfig::default(),
@@ -326,7 +329,10 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn platform_enabled(&self, platform: &str) -> bool {
-        self.platform_enable.get(platform).copied().unwrap_or(true)
+        self.platform_enable
+            .get(platform)
+            .copied()
+            .unwrap_or(!matches!(platform, "weibo" | "youtube" | "zhihu"))
     }
 }
 

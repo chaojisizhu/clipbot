@@ -47,6 +47,7 @@ auth:
     instagram: ""
   # Netscape 格式，按 domain/path/secure/过期时间匹配，支持 #HttpOnly_。
   # 抖音移动分享页 iesdouyin.com 的 Cookie 需放在此文件对应域中。
+  # login bilibili 默认保存 cookies/bilibili.txt，后续启动自动加载。
   cookieFiles: {}
   #  bilibili: "./cookies/bilibili.txt"
 
@@ -87,7 +88,10 @@ output:
     评论：${评论数}
     图片数量：${图片数量}
 
-platformEnable: {}
+platformEnable:
+  weibo: false
+  youtube: false
+  zhihu: false
 
 # 原项目附属功能，按需启用。extras 镜像包含 JM 所需 Python 工具。
 jmcomic:

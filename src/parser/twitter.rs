@@ -14,6 +14,9 @@ use crate::types::{ImageSize, ParsedData, VideoQuality, YtdlpConfig};
 
 static STATUS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)(?:twitter\.com|x\.com)/[^/?]+/status(?:es)?/(\d+)").unwrap());
+const GENERIC_FORMAT_SELECTOR: &str = "best*[ext=mp4][vcodec!=?none][acodec!=?none]/best*[protocol=https][vcodec!=?none][acodec!=?none]";
+const TWITTER_FORMAT_SELECTOR: &str =
+    "best*[ext=mp4][protocol=https][vcodec!=?none]/best*[ext=mp4][protocol=http][vcodec!=?none]";
 
 pub fn extract_twitter_status_id(url: &str) -> Option<String> {
     STATUS_RE
@@ -41,11 +44,19 @@ async fn run_ytdlp_json(
     cookie_file: Option<&str>,
 ) -> anyhow::Result<Value> {
     let mut args = vec![
-        "--dump-single-json".into(), "--skip-download".into(), "--no-playlist".into(),
-        "--ignore-config".into(), "--no-warnings".into(),
-        "--sleep-requests".into(), "0.8".into(),
-        "--socket-timeout".into(), "15".into(), "--retries".into(), "1".into(),
-        "--format".into(), "best[ext=mp4][vcodec!=none][acodec!=none]/best[protocol=https][vcodec!=none][acodec!=none]".into(),
+        "--dump-single-json".into(),
+        "--skip-download".into(),
+        "--no-playlist".into(),
+        "--ignore-config".into(),
+        "--no-warnings".into(),
+        "--sleep-requests".into(),
+        "0.8".into(),
+        "--socket-timeout".into(),
+        "15".into(),
+        "--retries".into(),
+        "1".into(),
+        "--format".into(),
+        ytdlp_format_selector(url).into(),
     ];
     let cookie_file = cookie_file
         .filter(|path| !path.trim().is_empty())
@@ -85,13 +96,47 @@ async fn run_ytdlp_json(
                 debug!("yt-dlp 命令不可用，尝试下一个候选: {command} ({err})");
                 last_error = Some(err);
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(safe_ytdlp_error(err)),
         }
     }
     anyhow::bail!("{}", last_error.unwrap_or_else(|| "yt-dlp 不可用".into()))
 }
 
-fn pick_direct_mp4s(formats: Option<&Vec<Value>>) -> Vec<VideoQuality> {
+fn ytdlp_format_selector(raw_url: &str) -> &'static str {
+    let is_twitter_post = url::Url::parse(raw_url).ok().is_some_and(|url| {
+        matches!(
+            url.host_str(),
+            Some("x.com" | "www.x.com" | "twitter.com" | "www.twitter.com" | "mobile.twitter.com")
+        ) && STATUS_RE.is_match(url.as_str())
+    });
+    if is_twitter_post {
+        TWITTER_FORMAT_SELECTOR
+    } else {
+        GENERIC_FORMAT_SELECTOR
+    }
+}
+
+fn safe_ytdlp_error(error: ProcessError) -> anyhow::Error {
+    let message = error.to_string().to_ascii_lowercase();
+    if ["cookie file entry", "auth_token", "ct0"]
+        .iter()
+        .any(|marker| message.contains(marker))
+    {
+        anyhow::anyhow!("本地 yt-dlp 无法读取登录 Cookie，请检查 Netscape Cookie 文件格式")
+    } else {
+        error.into()
+    }
+}
+
+fn is_direct_mp4(url: &str, protocol: &str) -> bool {
+    matches!(protocol, "http" | "https")
+        && url::Url::parse(url).ok().is_some_and(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.path().to_ascii_lowercase().ends_with(".mp4")
+        })
+}
+
+fn pick_direct_mp4s(formats: Option<&Vec<Value>>, allow_silent: bool) -> Vec<VideoQuality> {
     let mut videos: Vec<VideoQuality> = formats
         .into_iter()
         .flatten()
@@ -108,7 +153,8 @@ fn pick_direct_mp4s(formats: Option<&Vec<Value>>) -> Vec<VideoQuality> {
                 && matches!(protocol, "http" | "https")
                 && !url.contains(".m3u8")
                 && format.get("vcodec").and_then(Value::as_str) != Some("none")
-                && format.get("acodec").and_then(Value::as_str) != Some("none")
+                && (format.get("acodec").and_then(Value::as_str) != Some("none")
+                    || allow_silent && is_direct_mp4(url, protocol))
                 && format
                     .get("ext")
                     .and_then(Value::as_str)
@@ -150,7 +196,17 @@ pub fn map_ytdlp_json(info: &Value) -> ParsedData {
         return map_ytdlp_json(entry);
     }
 
-    let videos = pick_direct_mp4s(info.get("formats").and_then(Value::as_array));
+    let source = info
+        .get("extractor_key")
+        .or_else(|| info.get("extractor"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let allow_silent = matches!(
+        source.as_str(),
+        "twitter" | "twitteramplify" | "twitter:amplify"
+    );
+    let videos = pick_direct_mp4s(info.get("formats").and_then(Value::as_array), allow_silent);
     let mut parsed = ParsedData::empty("video");
     parsed.desc = info
         .get("description")
@@ -201,16 +257,18 @@ pub fn map_ytdlp_json(info: &Value) -> ParsedData {
         .first()
         .map(|video| video.url.clone())
         .unwrap_or_default();
+    let selected_url = info.get("url").and_then(Value::as_str).unwrap_or_default();
+    let selected_protocol = info
+        .get("protocol")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if parsed.video.is_empty()
-        && info.get("acodec").and_then(Value::as_str) != Some("none")
+        && (info.get("acodec").and_then(Value::as_str) != Some("none")
+            || allow_silent && is_direct_mp4(selected_url, selected_protocol))
         && info.get("vcodec").and_then(Value::as_str) != Some("none")
         && info.get("ext").and_then(Value::as_str) == Some("mp4")
     {
-        parsed.video = info
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        parsed.video = selected_url.to_string();
     }
     if let Some(headers) = info.get("http_headers").and_then(Value::as_object) {
         for name in ["Referer", "User-Agent", "Origin"] {
@@ -475,7 +533,7 @@ pub async fn parse_native(http: &SiteHttp, url: &str) -> anyhow::Result<ParsedDa
     let parsed = map_syndication(&data);
     if !parsed.has_media() {
         anyhow::bail!(
-            "X未返回公开媒体，请配置 auth.cookies.twitter，或为本地 yt-dlp 提供 Netscape Cookie 文件"
+            "X未返回公开媒体，请在 auth.cookieFiles.twitter 配置 Netscape Cookie 文件并启用 ytdlp.enabled"
         );
     }
     Ok(parsed)
@@ -489,7 +547,7 @@ pub async fn parse_ytdlp(
     let info = run_ytdlp_json(url, config, cookie_file).await?;
     let parsed = map_ytdlp_json(&info);
     if !parsed.has_media() {
-        anyhow::bail!("本地 yt-dlp 未获得带音轨的直链 MP4");
+        anyhow::bail!("本地 yt-dlp 未获得完整的直链 MP4");
     }
     Ok(parsed)
 }
@@ -497,6 +555,22 @@ pub async fn parse_ytdlp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cookie_parse_errors_do_not_expose_cookie_values() {
+        let error = safe_ytdlp_error(ProcessError::Failed(
+            "WARNING: skipping cookie file entry '.x.com\\tTRUE\\t/\\tTRUE\\t0\\tauth_token\\tfixture-secret-value'".into(),
+        ));
+        assert!(error.to_string().contains("Netscape"));
+        assert!(!error.to_string().contains("fixture-secret-value"));
+        assert_eq!(
+            safe_ytdlp_error(ProcessError::Failed(
+                "HTTP Error 429: Too Many Requests".into()
+            ))
+            .to_string(),
+            "HTTP Error 429: Too Many Requests"
+        );
+    }
 
     #[test]
     fn extracts_status_ids() {
@@ -510,6 +584,35 @@ mod tests {
             Some("123456")
         );
         assert!(extract_twitter_status_id("https://x.com/nostatushere").is_none());
+    }
+
+    #[test]
+    fn accepts_unknown_codec_metadata_and_silent_twitter_mp4_only() {
+        let unknown = serde_json::json!({
+            "extractor_key":"Twitter",
+            "formats":[{"format_id":"http-2176", "protocol":"https", "ext":"mp4",
+                "url":"https://video.twimg.com/clip.mp4", "vcodec":null, "acodec":null}]
+        });
+        assert_eq!(
+            map_ytdlp_json(&unknown).video,
+            "https://video.twimg.com/clip.mp4"
+        );
+        let mut silent = unknown;
+        silent["formats"][0]["acodec"] = Value::String("none".into());
+        assert!(map_ytdlp_json(&silent).has_media());
+        silent["extractor_key"] = Value::String("Generic".into());
+        assert!(!map_ytdlp_json(&silent).has_media());
+        silent["extractor_key"] = Value::String("Twitter".into());
+        silent["formats"][0]["vcodec"] = Value::String("none".into());
+        assert!(!map_ytdlp_json(&silent).has_media());
+        assert_eq!(
+            ytdlp_format_selector("https://x.com/example/status/123"),
+            TWITTER_FORMAT_SELECTOR
+        );
+        assert_eq!(
+            ytdlp_format_selector("https://example.com/?url=x.com/example/status/123"),
+            GENERIC_FORMAT_SELECTOR
+        );
     }
 
     #[test]

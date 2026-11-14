@@ -49,6 +49,24 @@ fn normalize_config(mut config: AppConfig) -> AppConfig {
         push_api_key(&mut api_keys, api_key);
     }
     config.gpt_detect.api_keys = api_keys;
+    let bilibili_cookie = Path::new("cookies/bilibili.txt");
+    if !config
+        .auth
+        .cookies
+        .get("bilibili")
+        .is_some_and(|cookie| !cookie.trim().is_empty())
+        && !config
+            .auth
+            .cookie_files
+            .get("bilibili")
+            .is_some_and(|path| !path.trim().is_empty())
+        && bilibili_cookie.is_file()
+    {
+        config.auth.cookie_files.insert(
+            "bilibili".into(),
+            bilibili_cookie.to_string_lossy().into_owned(),
+        );
+    }
     if config.gpt_detect.keywords.is_empty() {
         config.gpt_detect.keywords = vec!["ai吗".into()];
     }
@@ -99,6 +117,13 @@ api:
         assert_eq!(cfg.qqbot.api_base, "https://api.bot.qq.com");
         assert_eq!(cfg.api.timeout, 42);
         assert_eq!(cfg.resources.cache_entries, 128);
+        assert!(!cfg.platform_enabled("weibo"));
+        assert!(!cfg.platform_enabled("youtube"));
+        assert!(!cfg.platform_enabled("zhihu"));
+        let explicitly_enabled: AppConfig =
+            serde_yaml::from_str("platformEnable: {zhihu: true}").unwrap();
+        assert!(explicitly_enabled.platform_enabled("zhihu"));
+        assert!(!explicitly_enabled.platform_enabled("youtube"));
     }
 
     #[test]

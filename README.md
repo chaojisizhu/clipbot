@@ -47,6 +47,21 @@ docker build --target test -t allvideo:test .
 
 ## 登录与平台覆盖
 
+B站可通过原站二维码登录并保存 Cookie。
+
+```powershell
+.\target\release\videorust.exe login bilibili
+```
+
+Linux 交付目录可运行 `./start.sh login bilibili`。用 B站 App 扫描生成的 `cookies/bilibili-login.png` 并在手机确认，成功后写入 `cookies/bilibili.txt`。后续启动会自动加载该文件。可用 `--cookie-file`、`--qr-file` 和 `--timeout-seconds` 指定路径与等待时间，指定 Cookie 文件路径时也可在 `auth.cookieFiles.bilibili` 配置复用。
+
+扫码确认后会检查原站登录状态。遇到原站 HTTP 412 或网络验证时，程序保留已取得的 Cookie 并显示校验状态。二维码过期或未确认时会返回可重试的提示。
+
+Docker 登录需要可写 Cookie 目录，可使用 `docker run --rm -it --mount type=bind,source=<Cookie目录绝对路径>,target=/app/cookies allvideo:local login bilibili`。
+
+当前默认关闭微博、YouTube 与知乎，可在 `platformEnable` 查看开关。小红书使用 `auth.cookies.xiaohongshu`，完整分享链接需保留 `xsec_token`。X 登录态使用 Netscape 文件，在 `auth.cookieFiles.twitter` 配置后启用 `ytdlp.enabled`，认证提取将优先使用本机 yt-dlp。
+
+
 按平台在 `auth.cookies` 填写浏览器完整 Cookie，或在 `auth.cookieFiles` 指向 Netscape 格式文件。Cookie 文件按域名、路径、HTTPS 标志和过期时间匹配。小红书分享链接需要保留 `xsec_token`。抖音移动分享域 `iesdouyin.com` 的 Cookie 需要在 Cookie 文件中对应此域配置。
 
 元宝登录态填写 `channels.yuanbaoCookie`，也可通过 `YUANBAO_COOKIE` 提供。配置、Cookie、环境文件、日志及构建产物已列入 Git 忽略规则。
