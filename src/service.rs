@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::bot::message::{
@@ -15,10 +15,7 @@ use crate::bot::message::{
     text_payload,
 };
 use crate::bot::qqbot::QQBotClient;
-use crate::parser::api::{
-    VideoParserService, decrypt_video_if_needed, download_media_buffer, head_content_length,
-    is_foreign_url,
-};
+use crate::parser::api::VideoParserService;
 use crate::parser::cardsearch::resolve_card_by_title;
 use crate::parser::formatter::generate_formatted_text;
 use crate::parser::gpt_detect::{
@@ -27,17 +24,79 @@ use crate::parser::gpt_detect::{
 };
 use crate::parser::jmcomic::{cleanup_jm_zip, extract_jm_id};
 use crate::parser::matcher::link_type_parser;
+use crate::parser::media::{
+    download_media_buffer_with_headers, head_content_length, is_foreign_url,
+};
+use crate::parser::remux::download_parsed_temp;
 use crate::types::{AppConfig, ChatType, LinkMatch, ParsedData, QQChatEvent};
 
 static ARCHIVE_EXT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\.(7z|zip)$").unwrap());
+static JM_TASK_GATE: Semaphore = Semaphore::const_new(1);
 
 pub struct AppState {
     config: Arc<AppConfig>,
     parser: Arc<VideoParserService>,
     bot: Arc<QQBotClient>,
-    dedup_cache: Mutex<HashMap<String, Instant>>,
+    dedup_cache: Arc<std::sync::Mutex<HashMap<String, DedupEntry>>>,
     gpt_detect_busy: AtomicBool,
     local_proxies: Vec<String>,
+}
+
+struct DedupEntry {
+    token: u128,
+    expires: Instant,
+    pending: bool,
+}
+
+struct BusyGuard<'a>(&'a AtomicBool);
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+struct AttachmentCleanup<'a>(&'a str);
+
+impl Drop for AttachmentCleanup<'_> {
+    fn drop(&mut self) {
+        cleanup_jm_zip(self.0);
+    }
+}
+
+struct DedupClaim {
+    cache: Arc<std::sync::Mutex<HashMap<String, DedupEntry>>>,
+    key: String,
+    token: u128,
+    interval: Duration,
+    committed: bool,
+}
+
+impl DedupClaim {
+    fn commit(&mut self) {
+        if let Ok(mut cache) = self.cache.lock()
+            && let Some(entry) = cache
+                .get_mut(&self.key)
+                .filter(|entry| entry.token == self.token)
+        {
+            entry.pending = false;
+            entry.expires = Instant::now() + self.interval;
+        }
+        self.committed = true;
+    }
+}
+
+impl Drop for DedupClaim {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Ok(mut cache) = self.cache.lock()
+            && cache
+                .get(&self.key)
+                .is_some_and(|entry| entry.token == self.token)
+        {
+            cache.remove(&self.key);
+        }
+    }
 }
 
 impl AppState {
@@ -57,7 +116,7 @@ impl AppState {
             config,
             parser,
             bot,
-            dedup_cache: Mutex::new(HashMap::new()),
+            dedup_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             gpt_detect_busy: AtomicBool::new(false),
             local_proxies,
         }
@@ -165,16 +224,25 @@ impl AppState {
         }
 
         let mut pending = Vec::new();
-        for item in matches {
-            if self.is_deduplicated(&item.url).await {
-                info!("链接处于去重冷却期内，跳过: {}", item.url);
+        for item in matches
+            .into_iter()
+            .take(self.config.resources.max_links_per_message.max(1))
+        {
+            if let Some(claim) = self.claim_link(&event, &item.url) {
+                pending.push((item, claim));
             } else {
-                pending.push(item);
+                info!("链接处于去重冷却期内，跳过: {}", item.url);
             }
         }
         if pending.is_empty() {
             return;
         }
+        // Keep the JM gate until the archive is uploaded and cleaned.
+        let _jm_permit = if jm_trigger.is_some() {
+            Some(JM_TASK_GATE.acquire().await.expect("JM 并发闸门保持打开"))
+        } else {
+            None
+        };
 
         let chat_label = match event.chat_type {
             ChatType::Group => format!("群 {}", event.chat_id),
@@ -185,7 +253,7 @@ impl AppState {
             pending.len(),
             pending
                 .iter()
-                .map(|item| item.url.as_str())
+                .map(|(item, _)| item.url.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -198,13 +266,13 @@ impl AppState {
                 .await;
         }
 
-        let mut parsed_results: Vec<(LinkMatch, ParsedData, String)> = Vec::new();
+        let mut parsed_results: Vec<(LinkMatch, ParsedData, String, DedupClaim)> = Vec::new();
         let mut failed_errors = Vec::new();
-        for item in pending {
+        for (item, claim) in pending {
             match self.parser.parse_url(&item.url, &item.media_type).await {
                 crate::parser::api::ParseResult::Success(data) => {
                     let text = generate_formatted_text(&data, &self.config.output.format);
-                    parsed_results.push((item, data, text));
+                    parsed_results.push((item, data, text, claim));
                 }
                 crate::parser::api::ParseResult::Failure(message) => {
                     warn!("解析失败 [{}]: {message}", item.url);
@@ -226,12 +294,16 @@ impl AppState {
             return;
         }
 
-        for (_, parsed, text) in parsed_results {
+        for (_, parsed, text, mut claim) in parsed_results {
             if let Some(attachment) = parsed.attachment.clone() {
-                self.send_attachment(&event, &attachment).await;
+                if self.send_attachment(&event, &attachment).await {
+                    claim.commit();
+                }
                 continue;
             }
-            self.send_media_result(&event, parsed, text).await;
+            if self.send_media_result(&event, parsed, text).await {
+                claim.commit();
+            }
         }
         info!("所有内容处理完成");
     }
@@ -262,6 +334,12 @@ impl AppState {
             return true;
         }
         if self.config.gpt_detect.api_key.is_empty()
+            && self
+                .config
+                .gpt_detect
+                .api_keys
+                .iter()
+                .all(|key| key.trim().is_empty())
             && std::env::var("OPENAI_API_KEY")
                 .unwrap_or_default()
                 .is_empty()
@@ -284,6 +362,7 @@ impl AppState {
                 .await;
             return true;
         }
+        let _busy = BusyGuard(&self.gpt_detect_busy);
 
         let image = event.quoted_images[0].clone();
         info!(
@@ -319,7 +398,6 @@ impl AppState {
                     .await;
             }
         }
-        self.gpt_detect_busy.store(false, Ordering::SeqCst);
         true
     }
 
@@ -341,35 +419,66 @@ impl AppState {
         }
     }
 
-    async fn send_message(&self, event: &QQChatEvent, payload: Value) {
+    async fn send_message(&self, event: &QQChatEvent, payload: Value) -> bool {
         if let Err(err) = self.bot.reply(event, &payload).await {
             warn!("发送消息失败 (已忽略): {err}");
-        }
-    }
-
-    async fn is_deduplicated(&self, url: &str) -> bool {
-        let interval = self.config.output.deduplication_interval;
-        if interval == 0 {
             return false;
         }
+        true
+    }
+
+    fn claim_link(&self, event: &QQChatEvent, url: &str) -> Option<DedupClaim> {
+        let interval = self.config.output.deduplication_interval;
+        let key = format!("{:?}:{}:{url}", event.chat_type, event.chat_id);
         let now = Instant::now();
-        let mut cache = self.dedup_cache.lock().await;
-        if cache.get(url).is_some_and(|expire| *expire > now) {
-            return true;
+        let mut cache = self.dedup_cache.lock().ok()?;
+        cache.retain(|_, entry| entry.pending || entry.expires > now);
+        if cache.contains_key(&key) {
+            return None;
         }
-        cache.insert(url.to_string(), now + Duration::from_secs(interval));
-        false
+        if cache.len() >= self.config.resources.cache_entries.max(1) {
+            let oldest = cache
+                .iter()
+                .filter(|(_, entry)| !entry.pending)
+                .min_by_key(|(_, entry)| entry.expires)
+                .map(|(key, _)| key.clone())?;
+            cache.remove(&oldest);
+        }
+        let token = rand::random();
+        cache.insert(
+            key.clone(),
+            DedupEntry {
+                token,
+                expires: now,
+                pending: true,
+            },
+        );
+        Some(DedupClaim {
+            cache: Arc::clone(&self.dedup_cache),
+            key,
+            token,
+            interval: Duration::from_secs(interval),
+            committed: false,
+        })
     }
 
     async fn localize_foreign_image(
         &self,
         event: &QQChatEvent,
         url: &str,
+        headers: &HashMap<String, String>,
     ) -> Option<(String, String)> {
         if !is_foreign_url(url) {
             return None;
         }
-        match download_media_buffer(url, &self.local_proxies, 20 * 1024 * 1024).await {
+        match download_media_buffer_with_headers(
+            url,
+            &self.local_proxies,
+            20 * 1024 * 1024,
+            headers,
+        )
+        .await
+        {
             Ok(buffer) => {
                 let file_name = format!(
                     "img_{}_{}.jpg",
@@ -450,27 +559,55 @@ impl AppState {
         })
     }
 
-    async fn send_attachment(&self, event: &QQChatEvent, attachment: &crate::types::Attachment) {
+    async fn upload_media_file(
+        &self,
+        event: &QQChatEvent,
+        file_type: u32,
+        file_name: &str,
+        path: &Path,
+    ) -> anyhow::Result<Value> {
+        Ok(match event.chat_type {
+            ChatType::Group => {
+                self.bot
+                    .upload_group_media_file(&event.chat_id, file_type, file_name, path)
+                    .await?
+            }
+            ChatType::Private => {
+                self.bot
+                    .upload_user_media_file(&event.chat_id, file_type, file_name, path)
+                    .await?
+            }
+        })
+    }
+
+    async fn send_attachment(
+        &self,
+        event: &QQChatEvent,
+        attachment: &crate::types::Attachment,
+    ) -> bool {
+        let _cleanup = AttachmentCleanup(&attachment.path);
         let result = async {
             let extension = ARCHIVE_EXT_RE
                 .find(attachment.file_name.as_deref().unwrap_or_default())
                 .map(|found| found.as_str().to_ascii_lowercase())
                 .unwrap_or_else(|| ".7z".into());
             let named_file = format!("密码{}{}", attachment.password, extension);
-            let buffer = tokio::fs::read(&attachment.path).await?;
             let upload = self
-                .upload_media_data(event, 4, &named_file, &buffer)
+                .upload_media_file(event, 4, &named_file, Path::new(&attachment.path))
                 .await?;
             let file_info = upload
                 .get("file_info")
                 .and_then(Value::as_str)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("文件上传响应缺少 file_info"))?;
-            self.send_message(event, media_payload(file_info)).await;
+            if !self.send_message(event, media_payload(file_info)).await {
+                anyhow::bail!("附件消息发送失败");
+            }
             info!("加密压缩包已发送: {named_file}");
             Ok::<(), anyhow::Error>(())
         }
         .await;
+        let succeeded = result.is_ok();
         if let Err(err) = result {
             warn!("附件发送失败: {err}");
             self.send_message(
@@ -482,10 +619,15 @@ impl AppState {
             )
             .await;
         }
-        cleanup_jm_zip(&attachment.path);
+        succeeded
     }
 
-    async fn send_media_result(&self, event: &QQChatEvent, parsed: ParsedData, text: String) {
+    async fn send_media_result(
+        &self,
+        event: &QQChatEvent,
+        parsed: ParsedData,
+        text: String,
+    ) -> bool {
         let is_video = !parsed.video.is_empty()
             && (parsed.media_type == "video"
                 || (parsed.media_type == "live"
@@ -501,20 +643,10 @@ impl AppState {
         let mut video_failed_note = String::new();
         if is_video && self.config.output.show_video_file {
             let relay_video = || async {
-                let max_bytes = if self.config.output.max_video_size > 0 {
-                    self.config.output.max_video_size * 1024 * 1024
-                } else {
-                    190 * 1024 * 1024
-                };
-                let mut buffer =
-                    download_media_buffer(&parsed.video, &self.local_proxies, max_bytes).await?;
-                if parsed.video_decode_key.is_some() {
-                    buffer = decrypt_video_if_needed(buffer, parsed.video_decode_key.as_deref())?;
-                    info!("视频号加密流已解密 ({}MB)", buffer.len() / 1024 / 1024);
-                }
+                let temporary = download_parsed_temp(&parsed, &self.config).await?;
                 let file_name = format!("video_{}.mp4", chrono::Utc::now().timestamp_millis());
                 let upload = self
-                    .upload_media_data(event, 2, &file_name, &buffer)
+                    .upload_media_file(event, 2, &file_name, temporary.path())
                     .await?;
                 let file_info = upload
                     .get("file_info")
@@ -522,11 +654,15 @@ impl AppState {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("分片上传响应缺少 file_info"))?
                     .to_string();
-                info!("视频已本地上传中转 ({}MB)", buffer.len() / 1024 / 1024);
+                info!("视频已本地上传中转 ({}MB)", temporary.size() / 1024 / 1024);
                 Ok::<String, anyhow::Error>(file_info)
             };
 
-            if parsed.video_decode_key.is_some() || is_foreign_url(&parsed.video) {
+            if parsed.video_decode_key.is_some()
+                || parsed.audio_url.is_some()
+                || is_foreign_url(&parsed.video)
+                || !parsed.media_headers.is_empty()
+            {
                 match relay_video().await {
                     Ok(file_info) => video_file_info = file_info,
                     Err(err) => {
@@ -620,7 +756,10 @@ impl AppState {
         let mut image_infos = Vec::new();
         let mut image_fail_count = 0usize;
         for image in &image_pool {
-            match self.resolve_image_file_info(event, image).await {
+            match self
+                .resolve_image_file_info(event, image, &parsed.media_headers)
+                .await
+            {
                 Ok(file_info) => image_infos.push(file_info),
                 Err(err) => {
                     warn!("图片发送失败: {err}");
@@ -629,6 +768,8 @@ impl AppState {
             }
         }
 
+        let transfer_succeeded = video_failed_note.is_empty() && image_fail_count == 0;
+        let mut delivered = true;
         let mut notes = Vec::new();
         if !video_failed_note.is_empty() {
             notes.push(video_failed_note);
@@ -654,35 +795,39 @@ impl AppState {
             markdown.push_str(&notes.join("\n"));
         }
         if !markdown.trim().is_empty() {
-            self.send_message(event, markdown_payload(markdown, false))
+            delivered &= self
+                .send_message(event, markdown_payload(markdown, false))
                 .await;
         }
 
         for file_info in image_infos {
-            self.send_message(event, media_payload(file_info)).await;
+            delivered &= self.send_message(event, media_payload(file_info)).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         if !video_file_info.is_empty() {
-            self.send_message(event, media_payload(video_file_info))
+            delivered &= self
+                .send_message(event, media_payload(video_file_info))
                 .await;
         }
+        transfer_succeeded && delivered
     }
 
     async fn resolve_image_file_info(
         &self,
         event: &QQChatEvent,
         image: &str,
+        headers: &HashMap<String, String>,
     ) -> anyhow::Result<String> {
         if is_foreign_url(image) {
-            let (_, file_info) =
-                self.localize_foreign_image(event, image)
-                    .await
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "境外图片中转失败: {}",
-                            image.chars().take(60).collect::<String>()
-                        )
-                    })?;
+            let (_, file_info) = self
+                .localize_foreign_image(event, image, headers)
+                .await
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "境外图片中转失败: {}",
+                        image.chars().take(60).collect::<String>()
+                    )
+                })?;
             return Ok(file_info);
         }
         match self
@@ -693,8 +838,13 @@ impl AppState {
             Ok(file_info) => Ok(file_info),
             Err(err) => {
                 warn!("图片平台转存失败，尝试本地上传中转: {err}");
-                let buffer =
-                    download_media_buffer(image, &self.local_proxies, 20 * 1024 * 1024).await?;
+                let buffer = download_media_buffer_with_headers(
+                    image,
+                    &self.local_proxies,
+                    20 * 1024 * 1024,
+                    headers,
+                )
+                .await?;
                 let file_name = format!(
                     "img_{}_{}.jpg",
                     chrono::Utc::now().timestamp_millis(),
@@ -752,4 +902,58 @@ pub fn attachment_extension(path: &str) -> String {
         .and_then(|extension| extension.to_str())
         .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
         .unwrap_or_else(|| ".7z".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> AppState {
+        let mut config = AppConfig::default();
+        config.resources.cache_entries = 2;
+        let config = Arc::new(config);
+        AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        )
+    }
+
+    #[test]
+    fn scopes_link_dedup_to_chat_and_releases_failed_claims() {
+        let state = state();
+        let first = QQChatEvent {
+            chat_id: "first".into(),
+            ..QQChatEvent::default()
+        };
+        let second = QQChatEvent {
+            chat_id: "second".into(),
+            ..QQChatEvent::default()
+        };
+        let mut claim = state
+            .claim_link(&first, "https://example.com/video")
+            .unwrap();
+        assert!(
+            state
+                .claim_link(&first, "https://example.com/video")
+                .is_none()
+        );
+        let second_claim = state
+            .claim_link(&second, "https://example.com/video")
+            .unwrap();
+        drop(second_claim);
+        assert!(
+            state
+                .claim_link(&second, "https://example.com/video")
+                .is_some()
+        );
+        claim.commit();
+        drop(claim);
+        assert!(
+            state
+                .claim_link(&first, "https://example.com/video")
+                .is_none()
+        );
+        assert!(state.dedup_cache.lock().unwrap().len() <= 2);
+    }
 }

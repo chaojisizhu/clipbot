@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -6,10 +7,12 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sha1::{Digest as Sha1Digest, Sha1};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{MissedTickBehavior, interval_at};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, error, info, warn};
 
 use crate::bot::message::{
@@ -21,6 +24,66 @@ use crate::types::{BotEvent, ChatType, QQApiError, QQBotConfig, QQChatEvent};
 pub const INTENT_GROUP_AND_C2C: u64 = 1 << 25;
 const PASSIVE_FALLBACK_CODES: &[i64] = &[40_034_128, 40_034_005, 40_034_026, 304_027];
 const DUPLICATE_SEQ_CODE: i64 = 40_054_005;
+const UPLOAD_BUFFER_SIZE: usize = 64 * 1024;
+const UPLOAD_HEAD_SIZE: u64 = 10_002_432;
+
+struct UploadPart {
+    index: u64,
+    url: String,
+    offset: u64,
+    length: u64,
+}
+
+fn upload_parts(prepare: &Value, file_size: u64) -> anyhow::Result<Vec<UploadPart>> {
+    let parts = prepare
+        .get("parts")
+        .and_then(Value::as_array)
+        .filter(|parts| !parts.is_empty() && parts.len() <= 4096)
+        .ok_or_else(|| anyhow::anyhow!("upload_prepare 分片列表为空或过长"))?;
+    let mut offset = 0u64;
+    let mut indices = std::collections::HashSet::new();
+    let mut result = Vec::with_capacity(parts.len());
+    for (position, part) in parts.iter().enumerate() {
+        let index = part
+            .get("index")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("分片缺少合法 index"))?;
+        let block = part
+            .get("block_size")
+            .and_then(value_to_i64)
+            .filter(|block| *block > 0)
+            .ok_or_else(|| anyhow::anyhow!("分片大小必须为正整数"))? as u64;
+        let remaining = file_size
+            .checked_sub(offset)
+            .filter(|remaining| *remaining > 0)
+            .ok_or_else(|| anyhow::anyhow!("分片超过文件范围"))?;
+        if !indices.insert(index) || (block > remaining && position + 1 != parts.len()) {
+            anyhow::bail!("分片编号重复或分片范围错误");
+        }
+        let url = part
+            .get("presigned_url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("分片缺少 presigned_url"))?;
+        let parsed = url::Url::parse(url)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("分片上传 URL 必须为 HTTP(S)");
+        }
+        let length = block.min(remaining);
+        result.push(UploadPart {
+            index,
+            url: url.into(),
+            offset,
+            length,
+        });
+        offset = offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow::anyhow!("分片范围溢出"))?;
+    }
+    if offset != file_size {
+        anyhow::bail!("分片总长度与文件长度不一致");
+    }
+    Ok(result)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QQBotError {
@@ -58,12 +121,14 @@ struct ConnectionOutcome {
 pub struct QQBotClient {
     config: QQBotConfig,
     http: reqwest::Client,
+    upload_http: reqwest::Client,
     token: Mutex<TokenState>,
     token_refresh_lock: Mutex<()>,
     session_id: Mutex<Option<String>>,
     last_seq: Mutex<Option<i64>>,
-    reply_seqs: Mutex<(HashMap<String, u64>, Instant)>,
+    reply_seqs: Mutex<HashMap<String, (u64, Instant)>>,
     seen_message_ids: Mutex<HashMap<String, Instant>>,
+    last_queue_warning: std::sync::Mutex<Option<Instant>>,
     reconnect_attempts: AtomicU32,
     stopped: AtomicBool,
     shutdown: Notify,
@@ -74,12 +139,20 @@ impl QQBotClient {
         Self {
             config,
             http: reqwest::Client::new(),
+            upload_http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .pool_max_idle_per_host(2)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(120))
+                .build()
+                .expect("QQ 媒体客户端初始化失败"),
             token: Mutex::new(TokenState::default()),
             token_refresh_lock: Mutex::new(()),
             session_id: Mutex::new(None),
             last_seq: Mutex::new(None),
-            reply_seqs: Mutex::new((HashMap::new(), Instant::now())),
+            reply_seqs: Mutex::new(HashMap::new()),
             seen_message_ids: Mutex::new(HashMap::new()),
+            last_queue_warning: std::sync::Mutex::new(None),
             reconnect_attempts: AtomicU32::new(0),
             stopped: AtomicBool::new(false),
             shutdown: Notify::new(),
@@ -251,17 +324,24 @@ impl QQBotClient {
         events: &mpsc::Sender<BotEvent>,
     ) -> ConnectionOutcome {
         info!("正在连接 QQ 官方网关...");
-        let (socket, _) = match connect_async(gateway_url).await {
-            Ok(connection) => connection,
-            Err(err) => {
-                error!("连接 QQ 网关失败: {err}");
-                return ConnectionOutcome {
-                    stop: false,
-                    resumable: true,
-                    close_code: None,
-                };
-            }
+        let websocket_config = WebSocketConfig {
+            max_message_size: Some(1024 * 1024),
+            max_frame_size: Some(1024 * 1024),
+            max_write_buffer_size: 1024 * 1024,
+            ..WebSocketConfig::default()
         };
+        let (socket, _) =
+            match connect_async_with_config(gateway_url, Some(websocket_config), false).await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    error!("连接 QQ 网关失败: {err}");
+                    return ConnectionOutcome {
+                        stop: false,
+                        resumable: true,
+                        close_code: None,
+                    };
+                }
+            };
         info!("✔ 已连接 QQ 官方网关，等待握手...");
         let (mut sink, mut stream) = socket.split();
         let mut heartbeat: Option<tokio::time::Interval> = None;
@@ -286,7 +366,7 @@ impl QQBotClient {
                         return ConnectionOutcome { stop: false, resumable: true, close_code: None };
                     }
                     let seq = *self.last_seq.lock().await;
-                    if sink.send(Message::Text(json!({ "op": 1, "d": seq }).to_string().into())).await.is_err() {
+                    if sink.send(Message::Text(json!({ "op": 1, "d": seq }).to_string())).await.is_err() {
                         return ConnectionOutcome { stop: false, resumable: true, close_code: None };
                     }
                     continue;
@@ -376,7 +456,7 @@ impl QQBotClient {
                                 })
                             };
                             if sink
-                                .send(Message::Text(identify.to_string().into()))
+                                .send(Message::Text(identify.to_string()))
                                 .await
                                 .is_err()
                             {
@@ -464,13 +544,13 @@ impl QQBotClient {
                     .and_then(|value| value.as_str())
                     .unwrap_or_default()
             );
-            let _ = events.send(BotEvent::Ready(data.clone())).await;
+            self.publish_event(events, BotEvent::Ready(data.clone()));
             return;
         }
         if dispatch_type == "RESUMED" {
             info!("✔ 会话已恢复，遗漏事件补发完成");
             self.reconnect_attempts.store(0, Ordering::SeqCst);
-            let _ = events.send(BotEvent::Resumed(data.clone())).await;
+            self.publish_event(events, BotEvent::Resumed(data.clone()));
             return;
         }
 
@@ -499,9 +579,30 @@ impl QQBotClient {
                 seen.retain(|_, timestamp| {
                     now.duration_since(*timestamp) <= Duration::from_secs(600)
                 });
+                if seen.len() > 2000
+                    && let Some(oldest) = seen
+                        .iter()
+                        .min_by_key(|(_, timestamp)| **timestamp)
+                        .map(|(key, _)| key.clone())
+                {
+                    seen.remove(&oldest);
+                }
             }
         }
-        let _ = events.send(BotEvent::Message(event)).await;
+        self.publish_event(events, BotEvent::Message(event));
+    }
+
+    fn publish_event(&self, events: &mpsc::Sender<BotEvent>, event: BotEvent) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = events.try_send(event) {
+            let now = Instant::now();
+            if let Ok(mut last_warning) = self.last_queue_warning.lock()
+                && last_warning
+                    .is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(30))
+            {
+                warn!("消息处理队列已满，已跳过新事件");
+                *last_warning = Some(now);
+            }
+        }
     }
 
     async fn normalize_message_event(
@@ -740,6 +841,165 @@ impl QQBotClient {
         .await
     }
 
+    pub async fn upload_group_media_file(
+        &self,
+        group_openid: &str,
+        file_type: u32,
+        file_name: &str,
+        path: &Path,
+    ) -> Result<Value, QQBotError> {
+        self.upload_media_file(
+            &format!("/v2/groups/{group_openid}"),
+            file_type,
+            file_name,
+            path,
+        )
+        .await
+    }
+
+    pub async fn upload_user_media_file(
+        &self,
+        user_openid: &str,
+        file_type: u32,
+        file_name: &str,
+        path: &Path,
+    ) -> Result<Value, QQBotError> {
+        self.upload_media_file(
+            &format!("/v2/users/{user_openid}"),
+            file_type,
+            file_name,
+            path,
+        )
+        .await
+    }
+
+    async fn upload_media_file(
+        &self,
+        base_path: &str,
+        file_type: u32,
+        file_name: &str,
+        path: &Path,
+    ) -> Result<Value, QQBotError> {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let size = file.metadata().await.map_err(anyhow::Error::from)?.len();
+        if size == 0 {
+            return Err(QQBotError::Other("上传文件为空".into()));
+        }
+        let mut md5_whole = md5::Context::new();
+        let mut md5_head = md5::Context::new();
+        let mut sha1 = Sha1::new();
+        let mut buffer = vec![0u8; UPLOAD_BUFFER_SIZE];
+        let mut read = 0u64;
+        loop {
+            let count = file.read(&mut buffer).await.map_err(anyhow::Error::from)?;
+            if count == 0 {
+                break;
+            }
+            md5_whole.consume(&buffer[..count]);
+            sha1.update(&buffer[..count]);
+            let head_bytes = UPLOAD_HEAD_SIZE.saturating_sub(read).min(count as u64) as usize;
+            md5_head.consume(&buffer[..head_bytes]);
+            read += count as u64;
+        }
+        if read != size {
+            return Err(QQBotError::Other("上传文件在计算摘要时发生变化".into()));
+        }
+        let prepare = self
+            .api_call(
+                reqwest::Method::POST,
+                &format!("{base_path}/upload_prepare"),
+                Some(&json!({
+                    "file_type": file_type,
+                    "file_size": size.to_string(),
+                    "file_name": file_name,
+                    "md5": format!("{:x}", md5_whole.compute()),
+                    "sha1": hex::encode(sha1.finalize()),
+                    "md5_10m": format!("{:x}", md5_head.compute())
+                })),
+                false,
+                Duration::from_secs(30),
+            )
+            .await?;
+        let upload_id = prepare
+            .get("upload_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| QQBotError::Other("upload_prepare 缺少 upload_id".into()))?;
+        let parts = upload_parts(&prepare, size)?;
+        // A fresh file handle is used for each request body. The stream owns its
+        // reader and yields at most 64 KiB even for very large server blocks.
+        for part in parts {
+            file.seek(std::io::SeekFrom::Start(part.offset))
+                .await
+                .map_err(anyhow::Error::from)?;
+            let mut remaining = part.length;
+            let mut block_md5 = md5::Context::new();
+            while remaining > 0 {
+                let count = remaining.min(buffer.len() as u64) as usize;
+                file.read_exact(&mut buffer[..count])
+                    .await
+                    .map_err(anyhow::Error::from)?;
+                block_md5.consume(&buffer[..count]);
+                remaining -= count as u64;
+            }
+            let mut body_file = tokio::fs::File::open(path)
+                .await
+                .map_err(anyhow::Error::from)?;
+            body_file
+                .seek(std::io::SeekFrom::Start(part.offset))
+                .await
+                .map_err(anyhow::Error::from)?;
+            let stream = futures_util::stream::try_unfold(
+                (body_file, part.length),
+                |(mut file, remaining)| async move {
+                    if remaining == 0 {
+                        return Ok::<_, std::io::Error>(None);
+                    }
+                    let mut chunk = vec![0u8; remaining.min(UPLOAD_BUFFER_SIZE as u64) as usize];
+                    file.read_exact(&mut chunk).await?;
+                    let remaining = remaining - chunk.len() as u64;
+                    Ok(Some((chunk, (file, remaining))))
+                },
+            );
+            self.upload_http
+                .put(&part.url)
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Length", part.length)
+                .body(reqwest::Body::wrap_stream(stream))
+                .send()
+                .await?
+                .error_for_status()?;
+            self.api_call(
+                reqwest::Method::POST,
+                &format!("{base_path}/upload_part_finish"),
+                Some(&json!({
+                    "upload_id": upload_id,
+                    "part_index": part.index,
+                    "block_size": part.length.to_string(),
+                    "md5": format!("{:x}", block_md5.compute())
+                })),
+                false,
+                Duration::from_secs(30),
+            )
+            .await?;
+        }
+        self.api_call(
+            reqwest::Method::POST,
+            &format!("{base_path}/files"),
+            Some(&json!({
+                "file_type": file_type,
+                "srv_send_msg": false,
+                "file_name": file_name,
+                "upload_id": upload_id
+            })),
+            false,
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
     async fn upload_media_data(
         &self,
         base_path: &str,
@@ -772,31 +1032,14 @@ impl QQBotClient {
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
             .ok_or_else(|| QQBotError::Other("upload_prepare 响应异常: 缺少 upload_id".into()))?;
-        let parts = prepare
-            .get("parts")
-            .and_then(Value::as_array)
-            .filter(|parts| !parts.is_empty())
-            .ok_or_else(|| QQBotError::Other("upload_prepare 响应异常: 缺少分片列表".into()))?;
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()?;
-        let mut offset = 0usize;
+        let parts = upload_parts(&prepare, data.len() as u64)?;
         for part in parts {
-            let index = part.get("index").and_then(Value::as_u64).unwrap_or(0);
-            let presigned_url = part
-                .get("presigned_url")
-                .and_then(Value::as_str)
-                .ok_or_else(|| QQBotError::Other("分片缺少 presigned_url".into()))?;
-            let block_size = part
-                .get("block_size")
-                .and_then(value_to_i64)
-                .unwrap_or(0)
-                .max(0) as usize;
-            let end = (offset + block_size).min(data.len());
-            let chunk = &data[offset.min(data.len())..end];
-            offset += block_size;
-            let response = client
-                .put(presigned_url)
+            let index = part.index;
+            let offset = part.offset as usize;
+            let chunk = &data[offset..offset + part.length as usize];
+            let response = self
+                .upload_http
+                .put(&part.url)
                 .timeout(Duration::from_secs(120))
                 .header("Content-Type", "application/octet-stream")
                 .body(chunk.to_vec())
@@ -841,12 +1084,22 @@ impl QQBotClient {
     async fn next_seq(&self, message_id: &str) -> u64 {
         let mut guard = self.reply_seqs.lock().await;
         let now = Instant::now();
-        if now.duration_since(guard.1) > Duration::from_secs(600) {
-            guard.0.clear();
-            guard.1 = now;
+        if guard.len() >= 4096 && !guard.contains_key(message_id) {
+            guard.retain(|_, (_, last_used)| {
+                now.duration_since(*last_used) <= Duration::from_secs(600)
+            });
+            if guard.len() >= 4096
+                && let Some(oldest) = guard
+                    .iter()
+                    .min_by_key(|(_, (_, last_used))| *last_used)
+                    .map(|(key, _)| key.clone())
+            {
+                guard.remove(&oldest);
+            }
         }
-        let sequence = guard.0.entry(message_id.to_string()).or_insert(0);
+        let (sequence, last_used) = guard.entry(message_id.to_string()).or_insert((0, now));
         *sequence += 1;
+        *last_used = now;
         *sequence
     }
 
@@ -939,6 +1192,24 @@ fn redact_url(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_invalid_upload_part_ranges() {
+        let part = |index, size| {
+            json!({
+                "index": index, "block_size": size, "presigned_url": "https://cos.example/part"
+            })
+        };
+        assert!(upload_parts(&json!({"parts":[part(0, 0)]}), 15).is_err());
+        assert!(upload_parts(&json!({"parts":[part(0, 4)]}), 15).is_err());
+        assert!(upload_parts(&json!({"parts":[part(0, 16),part(1, 4)]}), 15).is_err());
+        assert!(upload_parts(&json!({"parts":[part(0, 8),part(0, 8)]}), 15).is_err());
+        let too_many: Vec<_> = (0..4097).map(|index| part(index, 1)).collect();
+        assert!(upload_parts(&json!({"parts":too_many}), 4097).is_err());
+        let parts = upload_parts(&json!({"parts":[part(0, 8),part(1, i64::MAX)]}), 15).unwrap();
+        assert_eq!(parts[1].length, 7);
+        assert_eq!(parts[1].offset, 8);
+    }
     use crate::bot::message::{media_payload, quoted_text_payload, text_payload};
 
     #[test]

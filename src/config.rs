@@ -1,60 +1,27 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
 
 use crate::types::AppConfig;
 
-pub fn load_config(config_path: Option<&Path>) -> AppConfig {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut target = config_path.map(Path::to_path_buf);
-
-    if target.is_none() {
-        for name in ["config.yaml", "config.yml", "config.json"] {
-            let candidate = root.join(name);
-            if candidate.exists() {
-                target = Some(candidate);
-                break;
-            }
+pub fn load_config(config_path: Option<&Path>) -> Result<AppConfig> {
+    if let Some(path) = config_path {
+        return read_config(path);
+    }
+    for name in ["config.yaml", "config.yml", "config.json"] {
+        let path = Path::new(name);
+        if path.exists() {
+            return read_config(path);
         }
     }
-
-    if target.is_none() {
-        let example = root.join("config.example.yaml");
-        let yaml = root.join("config.yaml");
-        if example.exists() {
-            match fs::copy(&example, &yaml) {
-                Ok(_) => {
-                    info!("已自动从 config.example.yaml 创建 config.yaml 配置文件");
-                    target = Some(yaml);
-                }
-                Err(err) => warn!("创建 config.yaml 失败，将使用默认配置: {err}"),
-            }
-        }
-    }
-
-    let Some(target) = target else {
-        warn!("未找到配置文件，将使用默认内置配置");
-        return AppConfig::default();
-    };
-
-    match read_config(&target) {
-        Ok(config) => {
-            info!("已成功加载配置文件: {}", target.display());
-            config
-        }
-        Err(err) => {
-            warn!("加载配置文件失败，回退到默认配置: {err:#}");
-            AppConfig::default()
-        }
-    }
+    Ok(normalize_config(AppConfig::default()))
 }
 
 fn read_config(path: &Path) -> Result<AppConfig> {
     let content =
         fs::read_to_string(path).with_context(|| format!("读取配置失败: {}", path.display()))?;
-    let mut config: AppConfig = if path
+    let config: AppConfig = if path
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
@@ -63,6 +30,11 @@ fn read_config(path: &Path) -> Result<AppConfig> {
     } else {
         serde_yaml::from_str(&content)?
     };
+    Ok(normalize_config(config))
+}
+
+fn normalize_config(mut config: AppConfig) -> AppConfig {
+    apply_environment(&mut config);
     let mut api_keys = Vec::new();
     if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
         push_api_key(&mut api_keys, &api_key);
@@ -80,7 +52,25 @@ fn read_config(path: &Path) -> Result<AppConfig> {
     if config.gpt_detect.keywords.is_empty() {
         config.gpt_detect.keywords = vec!["ai吗".into()];
     }
-    Ok(config)
+    config
+}
+
+fn apply_environment(config: &mut AppConfig) {
+    for (name, target) in [
+        ("QQBOT_APP_ID", &mut config.qqbot.app_id),
+        ("QQBOT_APP_SECRET", &mut config.qqbot.app_secret),
+        ("YUANBAO_COOKIE", &mut config.channels.yuanbao_cookie),
+        ("ALLVIDEO_PROXY", &mut config.api.proxy),
+    ] {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            *target = value;
+        }
+    }
+    if config.gpt_detect.api_key.is_empty() {
+        config.gpt_detect.api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
+    }
 }
 
 fn push_api_key(keys: &mut Vec<String>, api_key: &str) {
@@ -108,10 +98,7 @@ api:
         assert_eq!(cfg.qqbot.app_id, "test");
         assert_eq!(cfg.qqbot.api_base, "https://api.bot.qq.com");
         assert_eq!(cfg.api.timeout, 42);
-        assert_eq!(
-            cfg.api.primary_url,
-            "https://api.bugpk.com/api/short_videos"
-        );
+        assert_eq!(cfg.resources.cache_entries, 128);
     }
 
     #[test]

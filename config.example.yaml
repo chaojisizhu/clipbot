@@ -1,0 +1,112 @@
+# 凭据可通过 QQBOT_APP_ID、QQBOT_APP_SECRET、YUANBAO_COOKIE 环境变量提供。
+qqbot:
+  appId: ""
+  appSecret: ""
+  apiBase: "https://api.bot.qq.com"
+  receiveAllMessages: true
+  parseMiniappCards: false
+  autoParse: true
+  commandPrefix: ["/parse", "解析", "video"]
+  showWaitingTip: true
+  showParseError: true
+  debug: false
+
+# 仅调用平台原站。旧 primaryUrl、backupUrl、customApis 配置会被忽略。
+api:
+  timeout: 30000
+  maxConcurrency: 3
+  retryTimes: 2
+  retryInterval: 500
+  # 同一平台串行请求。请求间隔与随机抖动的单位均为毫秒。
+  minRequestInterval: 800
+  requestJitter: 250
+  # 访问验证默认冷却秒数，429 优先采用 Retry-After。
+  rateLimitCooldown: 60
+  # 网络请求失败时使用此代理重试。容器内可使用 http://host.docker.internal:7890。
+  proxy: ""
+
+resources:
+  maxMessageTasks: 4
+  maxLinksPerMessage: 3
+  cacheEntries: 128
+  maxCacheBytes: 8388608
+  cacheTtlSeconds: 120
+  maxResponseBytes: 4194304
+  maxTempBytes: 536870912
+
+auth:
+  # 浏览器完整 Cookie 请求头，按平台配置，且仅发送至该平台域名。
+  cookies:
+    bilibili: ""
+    douyin: ""
+    kuaishou: ""
+    xiaohongshu: ""
+    weibo: ""
+    twitter: ""
+    youtube: ""
+    instagram: ""
+  # Netscape 格式，按 domain/path/secure/过期时间匹配，支持 #HttpOnly_。
+  # 抖音移动分享页 iesdouyin.com 的 Cookie 需放在此文件对应域中。
+  cookieFiles: {}
+  #  bilibili: "./cookies/bilibili.txt"
+
+channels:
+  enabled: true
+  yuanbaoCookie: ""
+
+# 可选本机提取器，默认关闭。启用后仅在原生规则缺失时调用本机进程。
+ytdlp:
+  enabled: false
+  command: "yt-dlp"
+  timeout: 90000
+  proxy: ""
+  cookieFile: ""
+
+output:
+  showImageText: true
+  showCover: true
+  showVideoFile: true
+  maxDescLength: 200
+  videoDownloadTimeout: 120000
+  videoSendTimeout: 60000
+  tempDir: "./temp_videos"
+  maxVideoSize: 190
+  maxMarkdownImages: 9
+  deduplicationInterval: 180
+  # HLS/DASH 以本地 FFmpeg 直接封装，使用 -c copy 并限制单线程。
+  ffmpegCommand: "ffmpeg"
+  format: |
+    标题：${标题}
+    作者：${作者}
+    简介：${简介}
+    时长：${视频时长}
+    点赞：${点赞数}
+    收藏：${收藏数}
+    转发：${转发数}
+    播放：${播放数}
+    评论：${评论数}
+    图片数量：${图片数量}
+
+platformEnable: {}
+
+# 原项目附属功能，按需启用。extras 镜像包含 JM 所需 Python 工具。
+jmcomic:
+  enabled: false
+  python: "python3"
+  timeout: 300000
+  tempDir: "./temp_jm"
+  maxPages: 200
+  maxBytes: 199229440
+  threads: 1
+  proxy: ""
+  password: ""
+
+gptDetect:
+  enabled: false
+  keywords: ["ai吗"]
+  apiKey: ""
+  apiKeys: []
+  baseUrl: "https://api.openai.com/v1"
+  proxy: ""
+  timeout: 60000
+  maxImageSizeMb: 50

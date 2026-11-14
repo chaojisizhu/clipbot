@@ -8,7 +8,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use crate::parser::api::download_media_buffer;
+use crate::parser::media::download_media_buffer;
 use crate::types::{GptDetectConfig, QQImageAttachment};
 
 pub const GPT_DETECT_WAITING_TEXT: &str = "正在检测OpenAI水印";

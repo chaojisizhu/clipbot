@@ -1,93 +1,198 @@
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
+use tokio::task::JoinSet;
 use videorust::bot::qqbot::QQBotClient;
 use videorust::config::load_config;
-use videorust::parser::api::VideoParserService;
+use videorust::parser::api::{ParseResult, VideoParserService};
+use videorust::parser::matcher::link_type_parser;
+use videorust::parser::remux::download_parsed_temp;
 use videorust::service::AppState;
-use videorust::types::{BotEvent, QQChatEvent};
+use videorust::types::{AppConfig, BotEvent};
 
-#[tokio::main]
-async fn main() {
-    let config = load_config(None);
-    init_logging(config.qqbot.debug);
-    info_banner();
-
-    if config.qqbot.app_id.is_empty() || config.qqbot.app_secret.is_empty() {
-        tracing::error!(
-            "未配置 qqbot.appId / qqbot.appSecret，请编辑 config.yaml 填入 QQ 开放平台机器人的 AppID 与 AppSecret"
-        );
-        std::process::exit(1);
-    }
-
-    let config = Arc::new(config);
-    let parser = Arc::new(VideoParserService::new((*config).clone()));
-    let bot = Arc::new(QQBotClient::new(config.qqbot.clone()));
-    let state = Arc::new(AppState::new(
-        Arc::clone(&config),
-        Arc::clone(&parser),
-        Arc::clone(&bot),
-    ));
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(256);
-    let mut bot_task = tokio::spawn(Arc::clone(&bot).run(events_tx));
-    let mut bot_finished = false;
-
-    loop {
-        tokio::select! {
-            event = events_rx.recv() => {
-                match event {
-                    Some(BotEvent::Message(message)) => {
-                        spawn_message(Arc::clone(&state), message);
-                    }
-                    Some(BotEvent::Ready(_)) => {
-                        tracing::info!("🎉 QQ 官方视频解析机器人已就绪");
-                    }
-                    Some(BotEvent::Resumed(_)) => {
-                        tracing::info!("QQ 机器人会话已恢复");
-                    }
-                    None => break,
-                }
-            }
-            result = &mut bot_task => {
-                bot_finished = true;
-                match result {
-                    Ok(Ok(())) => tracing::warn!("QQ 机器人连接循环已退出"),
-                    Ok(Err(err)) => tracing::error!("启动 QQ 机器人失败: {err:#}"),
-                    Err(err) => tracing::error!("QQ 机器人任务异常: {err}"),
-                }
-                break;
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("收到退出信号，正在停止机器人...");
-                bot.stop();
-                break;
-            }
+#[tokio::main(worker_threads = 2)]
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::ExitCode::FAILURE
         }
     }
+}
 
-    if !bot_finished {
-        bot.stop();
-        let _ = bot_task.await;
+async fn run() -> Result<()> {
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        println!(
+            "AllVideo Rust\n\n用法\n  videorust [--config config.yaml] bot\n  videorust [--config config.yaml] parse <分享链接>...\n  videorust [--config config.yaml] probe <分享链接>\n  videorust [--config config.yaml] check\n\nparse 输出 JSON。probe 解析并流式下载校验，随后清理文件。默认命令为 bot。"
+        );
+        return Ok(());
     }
-}
-
-fn spawn_message(state: Arc<AppState>, message: QQChatEvent) {
-    tokio::spawn(async move {
-        state.handle_message(message).await;
+    if args.first().is_some_and(|arg| arg == "--version") {
+        println!("allvideo {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let config_path = if let Some(index) = args.iter().position(|arg| arg == "--config") {
+        if index + 1 >= args.len() {
+            bail!("--config 缺少路径");
+        }
+        let path = PathBuf::from(args.remove(index + 1));
+        args.remove(index);
+        Some(path)
+    } else {
+        None
+    };
+    let config = load_config(config_path.as_deref())?;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(if config.qqbot.debug { "debug" } else { "info" })
     });
-}
-
-fn init_logging(debug: bool) {
-    use tracing_subscriber::EnvFilter;
-    let fallback = if debug { "debug" } else { "info" };
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(fallback));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(std::io::stderr)
         .try_init();
+    let command = args.first().map(String::as_str).unwrap_or("bot");
+    let parser = Arc::new(VideoParserService::new(config.clone())?);
+    match command {
+        "check" => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "parser": "native-rust",
+                    "qqConfigured": !config.qqbot.app_id.is_empty() && !config.qqbot.app_secret.is_empty(),
+                    "yuanbaoConfigured": !config.channels.yuanbao_cookie.is_empty(),
+                    "cookiePlatforms": config.auth.cookies.iter().filter(|(_, value)| !value.trim().is_empty()).map(|(key, _)| key).collect::<Vec<_>>(),
+                    "cookieFilePlatforms": config.auth.cookie_files.keys().collect::<Vec<_>>(),
+                    "localYtdlpEnabled": config.ytdlp.enabled,
+                    "parseConcurrency": config.api.max_concurrency.clamp(1,16),
+                    "maxMessageTasks": config.resources.max_message_tasks.clamp(1,32),
+                    "maxTempBytes": config.resources.max_temp_bytes,
+                })
+            );
+            Ok(())
+        }
+        "parse" | "probe" => {
+            if args.len() < 2 {
+                bail!("请提供分享链接");
+            }
+            if args.len() > 17 {
+                bail!("单次命令最多16个链接");
+            }
+            let mut failed = false;
+            for url in &args[1..] {
+                let hits = link_type_parser(url);
+                let hit = hits.first().context("未识别到支持的分享链接")?;
+                let result = parser.parse_url(&hit.url, &hit.media_type).await;
+                if command == "probe" {
+                    match &result {
+                        ParseResult::Success(data) if !data.video.is_empty() => {
+                            let file = download_parsed_temp(data, &config).await?;
+                            println!(
+                                "{}",
+                                serde_json::json!({"status":"success", "platform":hit.media_type, "title":data.title, "downloadedBytes":file.size(), "cleanupOnExit":true})
+                            );
+                        }
+                        ParseResult::Success(data) => println!(
+                            "{}",
+                            serde_json::json!({"status":"success", "images":data.images.len(), "title":data.title})
+                        ),
+                        ParseResult::Failure(_) => {
+                            failed = true;
+                            println!("{}", serde_json::to_string(&result)?);
+                        }
+                    }
+                } else {
+                    failed |= matches!(result, ParseResult::Failure(_));
+                    println!("{}", serde_json::to_string(&result)?);
+                }
+            }
+            if failed {
+                bail!("部分链接解析失败");
+            }
+            Ok(())
+        }
+        "bot" => run_bot(config, parser).await,
+        _ => bail!("未知命令 {command}，使用 --help 查看用法"),
+    }
 }
 
-fn info_banner() {
-    tracing::info!("========================================================");
-    tracing::info!("  QQ 官方机器人 全平台视频解析机器人 启动中...");
-    tracing::info!("========================================================");
+async fn run_bot(config: AppConfig, parser: Arc<VideoParserService>) -> Result<()> {
+    if config.qqbot.app_id.is_empty() || config.qqbot.app_secret.is_empty() {
+        bail!(
+            "请填写 qqbot.appId / qqbot.appSecret，或设置 QQBOT_APP_ID / QQBOT_APP_SECRET。可先使用 parse 命令测试解析。"
+        );
+    }
+    let task_limit = config.resources.max_message_tasks.clamp(1, 32);
+    let config = Arc::new(config);
+    let bot = Arc::new(QQBotClient::new(config.qqbot.clone()));
+    let state = Arc::new(AppState::new(config, parser, Arc::clone(&bot)));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let mut bot_task = tokio::spawn(Arc::clone(&bot).run(tx));
+    let mut workers = JoinSet::new();
+    let mut finished = false;
+    let mut bot_result = Ok(());
+    loop {
+        tokio::select! {
+            event = rx.recv(), if workers.len() < task_limit => {
+                match event {
+                    Some(BotEvent::Message(message)) => {
+                        let state = Arc::clone(&state);
+                        workers.spawn(async move { state.handle_message(message).await; });
+                    }
+                    Some(BotEvent::Ready(_)) => tracing::info!("QQ机器人已连接"),
+                    Some(BotEvent::Resumed(_)) => tracing::info!("QQ会话已恢复"),
+                    None => break,
+                }
+            }
+            result = workers.join_next(), if !workers.is_empty() => {
+                if let Some(Err(error)) = result { tracing::warn!("消息任务退出 {error}"); }
+            }
+            result = &mut bot_task => {
+                finished = true;
+                bot_result = result.context("QQ网关任务异常")?;
+                break;
+            }
+            _ = shutdown_signal() => break,
+        }
+    }
+    bot.stop();
+    if !finished
+        && tokio::time::timeout(Duration::from_secs(5), &mut bot_task)
+            .await
+            .is_err()
+    {
+        bot_task.abort();
+        let _ = bot_task.await;
+    }
+    if tokio::time::timeout(Duration::from_secs(10), async {
+        while workers.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        workers.abort_all();
+        while workers.join_next().await.is_some() {}
+    }
+    bot_result
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("无法注册SIGTERM处理器");
+        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = terminate.recv() => {} }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

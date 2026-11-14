@@ -270,18 +270,18 @@ async fn fetch_feed_info(
     if !status.is_success() {
         anyhow::bail!("视频号详情接口异常: HTTP {}", status.as_u16());
     }
-    if let Some(code) = data.get("errCode").and_then(Value::as_i64) {
-        if code != 0 {
-            anyhow::bail!(
-                "视频号详情失败: errCode {code} {}",
-                data.get("errMsg")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .chars()
-                    .take(150)
-                    .collect::<String>()
-            );
-        }
+    if let Some(code) = data.get("errCode").and_then(Value::as_i64)
+        && code != 0
+    {
+        anyhow::bail!(
+            "视频号详情失败: errCode {code} {}",
+            data.get("errMsg")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .chars()
+                .take(150)
+                .collect::<String>()
+        );
     }
     Ok(data)
 }
@@ -413,17 +413,16 @@ pub fn map_feed_to_parsed(feed: &Value) -> ParsedData {
         if let Some(h264) = info
             .pointer("/h264VideoInfo/videoUrl")
             .and_then(Value::as_str)
+            && h264 != parsed.video
         {
-            if h264 != parsed.video {
-                parsed.videos.insert(
-                    0,
-                    VideoQuality {
-                        quality: "h264".into(),
-                        url: h264.to_string(),
-                        bit_rate: None,
-                    },
-                );
-            }
+            parsed.videos.insert(
+                0,
+                VideoQuality {
+                    quality: "h264".into(),
+                    url: h264.to_string(),
+                    bit_rate: None,
+                },
+            );
         }
     }
     parsed

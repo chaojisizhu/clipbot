@@ -113,10 +113,10 @@ fn parse_message_scene_ext(data: &Value) -> HashMap<String, String> {
         let Some(item) = item.as_str() else {
             continue;
         };
-        if let Some((key, value)) = item.split_once('=') {
-            if !key.is_empty() {
-                result.insert(key.to_string(), value.to_string());
-            }
+        if let Some((key, value)) = item.split_once('=')
+            && !key.is_empty()
+        {
+            result.insert(key.to_string(), value.to_string());
         }
     }
     result

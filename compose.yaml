@@ -1,0 +1,37 @@
+name: allvideo
+services:
+  allvideo:
+    build:
+      context: .
+      target: media
+    image: allvideo:local
+    init: true
+    restart: unless-stopped
+    user: "65532:65532"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    stop_grace_period: 20s
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16777216,mode=1777
+    environment:
+      QQBOT_APP_ID: ${QQBOT_APP_ID:-}
+      QQBOT_APP_SECRET: ${QQBOT_APP_SECRET:-}
+      YUANBAO_COOKIE: ${YUANBAO_COOKIE:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./cookies:/app/cookies:ro
+      - media:/app/temp_videos
+      - archives:/app/temp_jm
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+volumes:
+  media:
+  archives:

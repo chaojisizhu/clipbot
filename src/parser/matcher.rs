@@ -1,11 +1,7 @@
 use std::collections::HashSet;
-use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest::redirect::Policy;
-use tracing::debug;
 use url::Url;
 
 use crate::types::LinkMatch;
@@ -19,7 +15,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     [
         (
             "bilibili",
-            r"(?:https?://)?(?:(?:www\.)?bilibili\.com/(?:video/(BV\w+|av\d+)|bangumi/play/(ep\d+|ss\d+))|b23\.tv/([a-zA-Z0-9_-]+)|bili\d+\.cn/[a-zA-Z0-9_-]{4,})",
+            r#"(?:https?://)?(?:(?:www\.)?bilibili\.com/(?:video/(BV\w+|av\d+)|bangumi/play/(ep\d+|ss\d+))|b23\.tv/([a-zA-Z0-9_-]+)|bili2233\.cn/[a-zA-Z0-9_-]{4,})(?:\?[^\s"<>]+)?"#,
         ),
         (
             "douyin",
@@ -32,7 +28,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ("pipixia", r"(?:https?://)?(?:(?:h5\.)?pipix\.com/[^\s]+)"),
         (
             "pipigx",
-            r"(?:https?://)?(?:h5\.pipigx\.com/[^\s]+|pipigx\.com/[^\s]+)",
+            r"(?:https?://)?(?:(?:h5\.)?(?:pipigx|ippzone)\.com/[^\s]+)",
         ),
         (
             "toutiao",
@@ -40,7 +36,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ),
         (
             "xigua",
-            r"(?:https?://)?(?:www\.)?(?:ixigua\.com/(?:video/)?(\d+)|v\.ixigua\.com/([a-zA-Z0-9_-]+))",
+            r"(?:https?://)?(?:www\.)?(?:ixigua\.com/(?:video/)?(\d+)|v\.ixigua\.com/([a-zA-Z0-9_-]+)|iesdouyin\.com/xg/video/(\d+))",
         ),
         (
             "zuiyou",
@@ -52,7 +48,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ),
         (
             "xiaohongshu",
-            r"(?:https?://)?(?:www\.)?(?:xhslink\.com/[a-zA-Z0-9_-]+|xiaohongshu\.com/discovery/item/[a-zA-Z0-9_-]+(?:\?[^\s]*)?|xiaohongshu\.com/explore/[a-zA-Z0-9_-]+(?:\?[^\s]*)?)",
+            r"(?:https?://)?(?:www\.)?(?:xhslink\.com/(?:[a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+|xiaohongshu\.com/discovery/item/[a-zA-Z0-9_-]+(?:\?[^\s]*)?|xiaohongshu\.com/explore/[a-zA-Z0-9_-]+(?:\?[^\s]*)?)",
         ),
         (
             "weibo",
@@ -60,7 +56,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ),
         (
             "acfun",
-            r"(?:https?://)?(?:www\.)?acfun\.cn/(?:v/ac(\d+)|a/ac(\d+))",
+            r#"(?:https?://)?(?:www\.)?acfun\.cn/(?:v/ac(\d+)|a/ac(\d+))(?:\?[^\s"<>]+)?"#,
         ),
         (
             "zhihu",
@@ -68,16 +64,16 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ),
         (
             "weishi",
-            r"(?:https?://)?(?:www\.)?(?:weishi\.qq\.com/[^\s]+|isee\.weishi\.qq\.com/[^\s]+|h5\.weishi\.qq\.com/[^\s]+)",
+            r"(?:https?://)?(?:www\.)?(?:weishi\.qq\.com/[^\s]+|video\.weishi\.qq\.com/[^\s]+|isee\.weishi\.qq\.com/[^\s]+|h5\.weishi\.qq\.com/[^\s]+)",
         ),
-        ("huya", r"(?:https?://)?(?:huya\.com/[^\s]+|v\.huya\.com/[^\s]+)"),
+        ("huya", r"(?:https?://)?(?:(?:www\.|v\.)?huya\.com/[^\s]+|hy\.fan/[^\s]+)"),
         (
             "haokan",
             r"(?:https?://)?(?:haokan\.baidu\.com/v\?vid=(\d+)|haokan\.baidu\.com/[^\s]+)",
         ),
         (
             "meipai",
-            r"(?:https?://)?(?:www\.)?meipai\.com/media/(\d+)",
+            r"(?:https?://)?(?:www\.)?meipai\.com/(?:media/(\d+)|video/\d+/(\d+))",
         ),
         (
             "youtube",
@@ -122,7 +118,10 @@ pub fn link_type_parser(content: &str) -> Vec<LinkMatch> {
             let Some(found) = capture.get(0) else {
                 continue;
             };
-            let mut url = found.as_str().to_string();
+            let mut url = found
+                .as_str()
+                .trim_end_matches(['，', '。', '！', '？', ')', '）', '】', '》', '"', '\''])
+                .to_string();
             if !url.starts_with("http://") && !url.starts_with("https://") {
                 url = format!("https://{url}");
             }
@@ -157,28 +156,18 @@ pub fn clean_url(raw: &str) -> String {
     if host == "bilibili.com" {
         let _ = url.set_host(Some("www.bilibili.com"));
     }
-    if host.contains("douyin.com") {
-        let remove = [
-            "source",
-            "share_type",
-            "share_token",
-            "timestamp",
-            "from",
-            "isappinstalled",
-        ];
+    if host == "bilibili.com" || host.ends_with(".bilibili.com") {
         let pairs: Vec<(String, String)> = url
             .query_pairs()
-            .filter(|(key, _)| !remove.contains(&key.as_ref()))
+            .filter(|(key, _)| key == "p")
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
         url.set_query(None);
+        url.set_fragment(None);
         if !pairs.is_empty() {
             url.query_pairs_mut().extend_pairs(pairs);
         }
-        return strip_query(&url);
-    }
-    if host.contains("bilibili.com") || host.contains("b23.tv") {
-        return strip_query(&url);
+        return url.to_string();
     }
     if host == "x.com" || host == "www.x.com" {
         let _ = url.set_host(Some("twitter.com"));
@@ -218,69 +207,6 @@ pub fn clean_url(raw: &str) -> String {
     url.to_string()
 }
 
-fn strip_query(url: &Url) -> String {
-    format!(
-        "{}://{}{}",
-        url.scheme(),
-        url.host_str().unwrap_or_default(),
-        url.path()
-    )
-}
-
-pub async fn resolve_short_url(url: &str) -> String {
-    static SHORT_RE: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(
-            r"b23\.tv|bili\d+\.cn|v\.douyin\.com|v\.kuaishou\.com|xhslink\.com|t\.co|youtu\.be|h5\.pipix\.com/s/",
-        )
-        .unwrap()
-    });
-    if !SHORT_RE.is_match(url) {
-        return clean_url(url);
-    }
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        "User-Agent",
-        HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
-    );
-    headers.insert(
-        "Referer",
-        HeaderValue::from_static("https://www.baidu.com/"),
-    );
-    let direct = reqwest::Client::builder()
-        .redirect(Policy::none())
-        .timeout(Duration::from_secs(8))
-        .build();
-    if let Ok(client) = direct {
-        if let Ok(res) = client.get(url).headers(headers.clone()).send().await {
-            if res.status().is_redirection() {
-                if let Some(location) = res.headers().get(reqwest::header::LOCATION) {
-                    if let Ok(location) = location.to_str() {
-                        if let Ok(absolute) = Url::parse(url).and_then(|base| base.join(location)) {
-                            return clean_url(absolute.as_str());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let follow = reqwest::Client::builder()
-        .redirect(Policy::limited(8))
-        .timeout(Duration::from_secs(8))
-        .build();
-    match follow {
-        Ok(client) => match client.get(url).headers(headers).send().await {
-            Ok(res) => clean_url(res.url().as_str()),
-            Err(err) => {
-                debug!("短链解析失败: {err}");
-                clean_url(url)
-            }
-        },
-        Err(_) => clean_url(url),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +223,37 @@ mod tests {
         );
         assert!(links.iter().any(|m| m.media_type == "bilibili"));
         assert!(links.iter().any(|m| m.media_type == "kuaishou"));
+    }
+
+    #[test]
+    fn keeps_bilibili_and_acfun_parts_and_nested_short_paths() {
+        let hits = link_type_parser(
+            "https://www.bilibili.com/video/BV17x411w7KC?p=2&spm_id_from=test https://www.acfun.cn/v/ac123?p=2 https://xhslink.com/a/ABC123，",
+        );
+        assert_eq!(
+            clean_url(
+                &hits
+                    .iter()
+                    .find(|hit| hit.media_type == "bilibili")
+                    .unwrap()
+                    .url
+            ),
+            "https://www.bilibili.com/video/BV17x411w7KC?p=2"
+        );
+        assert!(
+            hits.iter()
+                .find(|hit| hit.media_type == "acfun")
+                .unwrap()
+                .url
+                .ends_with("?p=2")
+        );
+        assert_eq!(
+            hits.iter()
+                .find(|hit| hit.media_type == "xiaohongshu")
+                .unwrap()
+                .url,
+            "https://xhslink.com/a/ABC123"
+        );
     }
 
     #[test]

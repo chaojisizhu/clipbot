@@ -58,68 +58,65 @@ impl Default for UiTextConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct IsteroConfig {
-    pub token: String,
-    pub app_secret: String,
-    pub enable_sign: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct CustomApiConfig {
-    pub platform: String,
-    pub provider: Option<String>,
-    pub api_url: String,
-    pub token: Option<String>,
-    pub app_secret: Option<String>,
-    pub enable_sign: Option<bool>,
-}
-
-impl Default for CustomApiConfig {
-    fn default() -> Self {
-        Self {
-            platform: String::new(),
-            provider: None,
-            api_url: String::new(),
-            token: None,
-            app_secret: None,
-            enable_sign: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ApiConfig {
-    pub primary_url: String,
-    pub backup_url: String,
     pub timeout: u64,
     pub retry_times: u32,
     pub retry_interval: u64,
     pub proxy: String,
     pub max_concurrency: u32,
-    pub custom_apis: Vec<CustomApiConfig>,
-    pub platform_dedicated_first: HashMap<String, bool>,
+    pub min_request_interval: u64,
+    pub request_jitter: u64,
+    pub rate_limit_cooldown: u64,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            primary_url: "https://api.bugpk.com/api/short_videos".into(),
-            backup_url: "https://api.bugpk.com/api/svparse".into(),
             timeout: 30_000,
-            retry_times: 3,
-            retry_interval: 1_000,
-            proxy: std::env::var("http_proxy")
-                .or_else(|_| std::env::var("HTTP_PROXY"))
-                .unwrap_or_default(),
+            retry_times: 2,
+            retry_interval: 500,
+            proxy: String::new(),
             max_concurrency: 3,
-            custom_apis: Vec::new(),
-            platform_dedicated_first: HashMap::new(),
+            min_request_interval: 800,
+            request_jitter: 250,
+            rate_limit_cooldown: 60,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ResourceConfig {
+    pub max_message_tasks: usize,
+    pub max_links_per_message: usize,
+    pub cache_entries: usize,
+    pub max_cache_bytes: usize,
+    pub cache_ttl_seconds: u64,
+    pub max_response_bytes: usize,
+    pub max_temp_bytes: u64,
+}
+
+impl Default for ResourceConfig {
+    fn default() -> Self {
+        Self {
+            max_message_tasks: 4,
+            max_links_per_message: 3,
+            cache_entries: 128,
+            max_cache_bytes: 8 * 1024 * 1024,
+            cache_ttl_seconds: 120,
+            max_response_bytes: 4 * 1024 * 1024,
+            max_temp_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AuthConfig {
+    pub cookies: HashMap<String, String>,
+    pub cookie_files: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,11 +133,13 @@ pub struct OutputConfig {
     pub deduplication_interval: u64,
     pub max_markdown_images: usize,
     pub format: String,
+    pub ffmpeg_command: String,
 }
 
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
+            ffmpeg_command: "ffmpeg".into(),
             show_image_text: true,
             show_cover: true,
             show_video_file: true,
@@ -168,17 +167,19 @@ pub struct YtdlpConfig {
     pub command: String,
     pub proxy: String,
     pub timeout: u64,
+    pub cookie_file: String,
 }
 
 impl Default for YtdlpConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             command: "yt-dlp".into(),
             proxy: std::env::var("http_proxy")
                 .or_else(|_| std::env::var("HTTP_PROXY"))
                 .unwrap_or_default(),
             timeout: 90_000,
+            cookie_file: String::new(),
         }
     }
 }
@@ -211,6 +212,7 @@ pub struct JmConfig {
     pub timeout: u64,
     pub temp_dir: String,
     pub max_pages: usize,
+    pub max_bytes: u64,
     pub proxy: String,
     pub threads: u32,
 }
@@ -224,8 +226,9 @@ impl Default for JmConfig {
             timeout: 300_000,
             temp_dir: "./temp_jm".into(),
             max_pages: 0,
+            max_bytes: 190 * 1024 * 1024,
             proxy: String::new(),
-            threads: 10,
+            threads: 1,
         }
     }
 }
@@ -263,7 +266,8 @@ impl Default for GptDetectConfig {
 pub struct AppConfig {
     pub qqbot: QQBotConfig,
     pub ui_text: UiTextConfig,
-    pub istero: IsteroConfig,
+    pub resources: ResourceConfig,
+    pub auth: AuthConfig,
     pub platform_enable: HashMap<String, bool>,
     pub api: ApiConfig,
     pub output: OutputConfig,
@@ -307,7 +311,8 @@ impl Default for AppConfig {
         Self {
             qqbot: QQBotConfig::default(),
             ui_text: UiTextConfig::default(),
-            istero: IsteroConfig::default(),
+            resources: ResourceConfig::default(),
+            auth: AuthConfig::default(),
             platform_enable,
             api: ApiConfig::default(),
             output: OutputConfig::default(),
@@ -377,8 +382,12 @@ pub struct ParsedData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_size_map: Option<HashMap<String, ImageSize>>,
     pub video: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub media_headers: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_decode_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment: Option<Attachment>,
     pub videos: Vec<VideoQuality>,
@@ -415,16 +424,6 @@ pub struct LinkMatch {
     pub id: String,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ApiTarget {
-    pub url: String,
-    pub label: String,
-    pub provider: String,
-    pub token: Option<String>,
-    pub app_secret: Option<String>,
-    pub enable_sign: Option<bool>,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QQImageAttachment {
     pub url: String,
@@ -436,8 +435,9 @@ pub struct QQImageAttachment {
     pub size: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ChatType {
+    #[default]
     Group,
     Private,
 }
@@ -455,12 +455,6 @@ pub struct QQChatEvent {
     pub quoted_message_id: Option<String>,
     pub quoted_text: Option<String>,
     pub quoted_images: Vec<QQImageAttachment>,
-}
-
-impl Default for ChatType {
-    fn default() -> Self {
-        Self::Group
-    }
 }
 
 #[derive(Debug, thiserror::Error)]

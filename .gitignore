@@ -10,3 +10,6 @@
 /.tmp/
 *.log
 *.part
+
+**/__pycache__/
+*.py[cod]

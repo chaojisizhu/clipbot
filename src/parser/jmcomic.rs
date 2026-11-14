@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
@@ -7,14 +8,49 @@ use rand::RngCore;
 use regex::Regex;
 use tracing::{info, warn};
 
-use crate::parser::process::{ProcessError, spawn_capture, spawn_capture_in};
-use crate::parser::zipcrypto::{ZipEntry, create_encrypted_zip, random_password};
+use crate::parser::process::{
+    ProcessDiskBudget, ProcessError, disk_usage, spawn_capture_in_monitored,
+};
+use crate::parser::zipcrypto::{ZipFileEntry, random_password, write_encrypted_zip_file};
 use crate::types::{Attachment, JmConfig, ParsedData};
 
 static JM_ALBUM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^jm[ ]+(\d{3,})").unwrap());
 static JM_PHOTO_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?i)^jm[ ]+photo[ ]+(\d{3,})").unwrap());
 static IMAGE_EXT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\.(jpe?g|png|webp)$").unwrap());
+
+struct WorkDirectory {
+    root: PathBuf,
+    path: PathBuf,
+}
+
+impl Drop for WorkDirectory {
+    fn drop(&mut self) {
+        // Resolve the recursive deletion target against the configured temp root.
+        let Ok(resolved) = std::fs::canonicalize(&self.path) else {
+            return;
+        };
+        if resolved.parent() != Some(self.root.as_path()) {
+            return;
+        }
+        if let Err(error) = std::fs::remove_dir_all(&resolved) {
+            warn!("清理 JM 临时目录失败: {error}");
+        }
+    }
+}
+
+struct ArchiveOutput {
+    path: PathBuf,
+    persisted: bool,
+}
+
+impl Drop for ArchiveOutput {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JmTrigger {
@@ -43,12 +79,9 @@ fn resource_path(relative: &str) -> Option<PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
-    for candidate in [exe_dir.join(relative), exe_dir.join("..").join(relative)] {
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    [exe_dir.join(relative), exe_dir.join("..").join(relative)]
+        .into_iter()
+        .find(|candidate| candidate.exists())
 }
 
 fn command_on_path(name: &str) -> bool {
@@ -56,7 +89,10 @@ fn command_on_path(name: &str) -> bool {
         .map(|paths| {
             std::env::split_paths(&paths)
                 .map(|directory| directory.join(name))
-                .any(|candidate| candidate.is_file())
+                .any(|candidate| {
+                    candidate.is_file()
+                        || (cfg!(windows) && candidate.with_extension("exe").is_file())
+                })
         })
         .unwrap_or(false)
 }
@@ -96,12 +132,19 @@ async fn run_download(
     if config.threads > 0 {
         args.push(format!("--threads={}", config.threads.clamp(1, 32)));
     }
+    args.push(format!("--max-pages={}", config.max_pages));
     let timeout = Duration::from_millis(config.timeout.max(1));
-    let output = match spawn_capture(python, &args, timeout).await {
+    let budget = || {
+        Some(ProcessDiskBudget {
+            path: out_dir.to_owned(),
+            max_bytes: config.max_bytes,
+        })
+    };
+    let output = match spawn_capture_in_monitored(python, &args, timeout, None, budget()).await {
         Ok(output) => output,
         Err(ProcessError::NotFound(err)) if python == "python" => {
             warn!("python 不可用，回退 python3: {err}");
-            spawn_capture("python3", &args, timeout).await?
+            spawn_capture_in_monitored("python3", &args, timeout, None, budget()).await?
         }
         Err(err) => return Err(err.into()),
     };
@@ -111,6 +154,10 @@ async fn run_download(
             output.trim().chars().take(120).collect::<String>()
         );
     }
+    let path = out_dir.to_owned();
+    let maximum = config.max_bytes;
+    let size = tokio::task::spawn_blocking(move || disk_usage(&path, maximum)).await??;
+    anyhow::ensure!(size <= maximum, "JM 下载图片超过磁盘大小上限");
     Ok(())
 }
 
@@ -162,12 +209,16 @@ fn collect_images(root: &Path) -> Vec<PathBuf> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
                 walk(&path, output);
-            } else if path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| IMAGE_EXT_RE.is_match(name))
+            } else if kind.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| IMAGE_EXT_RE.is_match(name))
             {
                 output.push(path);
             }
@@ -177,13 +228,8 @@ fn collect_images(root: &Path) -> Vec<PathBuf> {
     walk(root, &mut output);
     output.sort_by(|left, right| {
         natural_cmp(
-            left.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default(),
-            right
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default(),
+            &left.strip_prefix(root).unwrap_or(left).to_string_lossy(),
+            &right.strip_prefix(root).unwrap_or(right).to_string_lossy(),
         )
     });
     output
@@ -195,19 +241,71 @@ pub async fn create_7z_archive(
     password: &str,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    create_selected_7z_archive(
+        work_dir,
+        output_path,
+        password,
+        timeout,
+        &collect_images(work_dir),
+        u32::MAX as u64,
+    )
+    .await
+}
+
+fn selected_file_list(work_dir: &Path, images: &[PathBuf]) -> anyhow::Result<String> {
+    images
+        .iter()
+        .map(|image| {
+            let relative = image.strip_prefix(work_dir)?;
+            let name = relative.to_string_lossy().replace('\\', "/");
+            anyhow::ensure!(
+                !name.contains(['\r', '\n']) && !name.starts_with('-'),
+                "压缩文件名无效"
+            );
+            Ok(format!("{name}\n"))
+        })
+        .collect()
+}
+
+async fn create_selected_7z_archive(
+    work_dir: &Path,
+    output_path: &Path,
+    password: &str,
+    timeout: Duration,
+    images: &[PathBuf],
+    max_bytes: u64,
+) -> anyhow::Result<()> {
     let seven_zip =
         seven_zip_command().ok_or_else(|| anyhow::anyhow!("找不到 7zr/7zz/7z 压缩工具"))?;
+    let list_path = work_dir.join(".allvideo-files.txt");
+    std::fs::write(&list_path, selected_file_list(work_dir, images)?)?;
     let args = vec![
         "a".into(),
         "-y".into(),
         format!("-p{password}"),
         "-mhe=on".into(),
-        "-mx=5".into(),
+        "-mx=0".into(),
+        "-mmt=1".into(),
         "-ms=off".into(),
+        "-scsUTF-8".into(),
         output_path.to_string_lossy().to_string(),
-        ".".into(),
+        format!("@{}", list_path.to_string_lossy()),
     ];
-    spawn_capture_in(&seven_zip, &args, timeout, Some(work_dir)).await?;
+    spawn_capture_in_monitored(
+        &seven_zip,
+        &args,
+        timeout,
+        Some(work_dir),
+        Some(ProcessDiskBudget {
+            path: output_path.to_owned(),
+            max_bytes,
+        }),
+    )
+    .await?;
+    anyhow::ensure!(
+        std::fs::metadata(output_path)?.len() <= max_bytes,
+        "JM 压缩包超过大小上限"
+    );
     Ok(())
 }
 
@@ -219,6 +317,11 @@ pub async fn download_jm_album(
     if !config.enabled {
         anyhow::bail!("JM 下载未启用");
     }
+    anyhow::ensure!(
+        !id.is_empty() && id.len() <= 20 && id.bytes().all(|byte| byte.is_ascii_digit()),
+        "JM 编号必须为1至20位数字"
+    );
+    anyhow::ensure!(config.max_bytes > 0, "JM maxBytes 必须大于零");
     let temp_dir = PathBuf::from(if config.temp_dir.is_empty() {
         "./temp_jm"
     } else {
@@ -226,7 +329,7 @@ pub async fn download_jm_album(
     });
     std::fs::create_dir_all(&temp_dir)?;
     let temp_dir = std::fs::canonicalize(&temp_dir)?;
-    let mut random = [0u8; 3];
+    let mut random = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut random);
     let work_dir = temp_dir.join(format!(
         "jm_{id}_{}_{}",
@@ -234,8 +337,12 @@ pub async fn download_jm_album(
         hex::encode(random)
     ));
     std::fs::create_dir_all(&work_dir)?;
+    let work = Arc::new(WorkDirectory {
+        root: temp_dir.clone(),
+        path: work_dir.clone(),
+    });
 
-    let result = async {
+    async {
         run_download(
             if config.python.is_empty() {
                 "python"
@@ -266,24 +373,31 @@ pub async fn download_jm_album(
             chrono::Utc::now().timestamp_millis(),
             hex::encode(random)
         );
-        let archive_path = if seven_zip_command().is_some() {
+        let mut archive = if seven_zip_command().is_some() {
             let path = temp_dir.join(format!("{unique}.7z"));
-            if let Err(err) =
-                create_7z_archive(&work_dir, &path, &password, Duration::from_secs(120)).await
-            {
-                let _ = std::fs::remove_file(&path);
-                return Err(err);
-            }
+            let archive = ArchiveOutput {
+                path,
+                persisted: false,
+            };
+            create_selected_7z_archive(
+                &work_dir,
+                &archive.path,
+                &password,
+                Duration::from_secs(120),
+                &images,
+                config.max_bytes,
+            )
+            .await?;
             info!(
                 "JM{id} 已打包 7z(AES-256): {} 页, {}MB",
                 images.len(),
-                std::fs::metadata(&path)
+                std::fs::metadata(&archive.path)
                     .map(|metadata| metadata.len() / 1024 / 1024)
                     .unwrap_or(0)
             );
-            path
+            archive
         } else {
-            let entries: Vec<ZipEntry> = images
+            let entries: Vec<ZipFileEntry> = images
                 .iter()
                 .enumerate()
                 .map(|(index, image)| {
@@ -292,24 +406,35 @@ pub async fn download_jm_album(
                         .and_then(|extension| extension.to_str())
                         .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
                         .unwrap_or_else(|| ".jpg".into());
-                    Ok(ZipEntry {
+                    ZipFileEntry {
                         name: format!("{:03}{extension}", index + 1),
-                        data: std::fs::read(image)?,
-                    })
+                        path: image.to_owned(),
+                    }
                 })
-                .collect::<std::io::Result<Vec<_>>>()?;
-            let zip = create_encrypted_zip(&entries, &password);
+                .collect();
             let path = temp_dir.join(format!("{unique}.zip"));
-            std::fs::write(&path, &zip)?;
-            info!(
-                "JM{id} 已打包加密 ZIP(回退模式): {} 页, {}MB",
-                entries.len(),
-                zip.len() / 1024 / 1024
-            );
-            path
+            let blocking_work = Arc::clone(&work);
+            let password = password.clone();
+            let album_id = id.to_owned();
+            let maximum = config.max_bytes;
+            tokio::task::spawn_blocking(move || {
+                let _work = blocking_work;
+                let size = write_encrypted_zip_file(&entries, &password, &path, maximum)?;
+                info!(
+                    "JM{album_id} 已流式打包加密 ZIP: {} 页, {}MB",
+                    entries.len(),
+                    size / 1024 / 1024
+                );
+                Ok::<_, anyhow::Error>(ArchiveOutput {
+                    path,
+                    persisted: false,
+                })
+            })
+            .await??
         };
 
-        let file_name = archive_path
+        let file_name = archive
+            .path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or_default()
@@ -319,20 +444,14 @@ pub async fn download_jm_album(
         parsed.desc = format!("JMComic 本子 {id} ({}页)", images.len());
         parsed.uid = id.to_string();
         parsed.attachment = Some(Attachment {
-            path: archive_path.to_string_lossy().to_string(),
+            path: archive.path.to_string_lossy().to_string(),
             password,
             file_name: Some(file_name),
         });
+        archive.persisted = true;
         Ok(parsed)
     }
-    .await;
-
-    if let Err(err) = std::fs::remove_dir_all(&work_dir) {
-        if work_dir.exists() {
-            warn!("清理 JM 临时目录失败: {err}");
-        }
-    }
-    result
+    .await
 }
 
 pub fn cleanup_jm_zip(path: &str) {
@@ -376,5 +495,40 @@ mod tests {
         let mut names = vec!["10.jpg", "2.jpg", "1.jpg", "001.jpg"];
         names.sort_by(|a, b| natural_cmp(a, b));
         assert_eq!(names, vec!["1.jpg", "001.jpg", "2.jpg", "10.jpg"]);
+    }
+
+    #[test]
+    fn keeps_chapter_order_and_archives_only_selected_images() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["2/001.jpg", "1/010.jpg", "1/002.jpg", "1/001.jpg"] {
+            let path = directory.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, [0]).unwrap();
+        }
+        std::fs::write(directory.path().join("debug.log"), [0]).unwrap();
+        let images = collect_images(directory.path());
+        assert_eq!(images.len(), 4);
+        let selected = selected_file_list(directory.path(), &images[..2]).unwrap();
+        assert_eq!(selected, "1/001.jpg\n1/002.jpg\n");
+    }
+
+    #[test]
+    fn cleanup_stays_inside_the_configured_temporary_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let path = root.join("jm-test-owned");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("001.jpg"), [0]).unwrap();
+        drop(WorkDirectory {
+            root: root.clone(),
+            path: path.clone(),
+        });
+        assert!(!path.exists());
+        drop(WorkDirectory {
+            root,
+            path: outside.path().to_owned(),
+        });
+        assert!(outside.path().exists());
     }
 }

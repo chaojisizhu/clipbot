@@ -1,23 +1,50 @@
 # -*- coding: utf-8 -*-
 # JMComic 下载包装脚本 (配合视频解析机器人使用)
-# 用法: python jm_download.py <album_id 或 photo_id> <输出目录> [--photo]
+# 用法: python jm_download.py <album_id 或 photo_id> <输出目录> [--photo] [--max-pages=N]
 # 完成后 stdout 打印: JM_OK <下载的图片文件数>
+import argparse
 import os
 import sys
+from threading import Lock
+
+
+def create_downloader(jmcomic, option, max_pages):
+    class LimitedDownloader(jmcomic.JmDownloader):
+        def __init__(self):
+            self.remaining_pages = max_pages if max_pages > 0 else None
+            self.page_lock = Lock()
+            super().__init__(option)
+
+        def do_filter(self, detail):
+            if not detail.is_photo() or self.remaining_pages is None:
+                return super().do_filter(detail)
+            # 在图片进入线程池之前预留整个章节的页额。
+            # 章节串行，因此相册所有章节共享一个按阅读顺序递减的预算。
+            with self.page_lock:
+                images = detail[:self.remaining_pages]
+                self.remaining_pages -= len(images)
+            return images
+
+        def download_by_photo_detail(self, photo):
+            if self.remaining_pages == 0:
+                return
+            return super().download_by_photo_detail(photo)
+
+    return LimitedDownloader()
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("JM_ERR 参数不足: jm_download.py <id> <out_dir> [--photo] [--proxy=URL]", file=sys.stderr)
-        sys.exit(2)
-
-    target_id = sys.argv[1]
-    out_dir = os.path.abspath(sys.argv[2])
-    is_photo = "--photo" in sys.argv
-    proxy = ""
-    for a in sys.argv:
-        if a.startswith("--proxy="):
-            proxy = a.split("=", 1)[1]
+    parser = argparse.ArgumentParser(description="JMComic 有界图片下载")
+    parser.add_argument("target_id")
+    parser.add_argument("out_dir")
+    parser.add_argument("--photo", action="store_true")
+    parser.add_argument("--proxy", default="")
+    parser.add_argument("--threads", type=int, default=3)
+    parser.add_argument("--max-pages", type=int, default=0)
+    args = parser.parse_args()
+    if args.max_pages < 0:
+        parser.error("--max-pages 必须大于或等于 0")
+    out_dir = os.path.abspath(args.out_dir)
 
     try:
         import jmcomic
@@ -28,19 +55,14 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
 
     postman = {"timeout": 20, "type": "requests"}
-    if proxy:
-        postman["proxies"] = {"http": proxy, "https": proxy}
+    if args.proxy:
+        postman["proxies"] = {"http": args.proxy, "https": args.proxy}
 
-    threads_image = 10
-    for a in sys.argv:
-        if a.startswith("--threads="):
-            try:
-                threads_image = max(1, min(32, int(a.split("=", 1)[1])))
-            except ValueError:
-                pass
+    threads_image = max(1, min(32, args.threads))
 
     option = jmcomic.JmOption.construct({
-        "dir_rule": {"base_dir": out_dir, "rule": "Bd"},
+        # 各章节的 00001.jpg 等同名页面分别保存，防止相互覆盖。
+        "dir_rule": {"base_dir": out_dir, "rule": "Bd/Pindex"},
         "client": {
             "impl": "api",
             "postman": postman,
@@ -48,16 +70,18 @@ def main():
         "download": {
             "cache": True,
             "image": {"decode": True, "suffix": ".jpg"},
-            # 多线程提速: 图片并发 + 章节并发
-            "threading": {"image": threads_image, "photo": 4},
+            "threading": {"image": threads_image, "photo": 1},
         },
     })
 
     try:
-        if is_photo:
-            jmcomic.download_photo(target_id, option)
-        else:
-            jmcomic.download_album(target_id, option)
+        with create_downloader(jmcomic, option, args.max_pages) as downloader:
+            if args.photo:
+                downloader.download_photo(args.target_id)
+            else:
+                downloader.download_album(args.target_id)
+            if downloader.download_failed_image or downloader.download_failed_photo:
+                raise RuntimeError("存在下载失败的图片或章节")
     except Exception as e:  # noqa: BLE001
         print(f"JM_ERR 下载失败: {e}", file=sys.stderr)
         sys.exit(4)

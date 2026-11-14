@@ -2,11 +2,12 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::parser::http::SiteHttp;
 use chrono::DateTime;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::parser::process::{ProcessError, spawn_capture};
 use crate::types::{ImageSize, ParsedData, VideoQuality, YtdlpConfig};
@@ -34,13 +35,29 @@ fn bundled_ytdlp() -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-async fn run_ytdlp_json(url: &str, config: &YtdlpConfig) -> anyhow::Result<Value> {
-    let mut args = vec!["-J".to_string(), "--no-warnings".to_string()];
+async fn run_ytdlp_json(
+    url: &str,
+    config: &YtdlpConfig,
+    cookie_file: Option<&str>,
+) -> anyhow::Result<Value> {
+    let mut args = vec![
+        "--dump-single-json".into(), "--skip-download".into(), "--no-playlist".into(),
+        "--ignore-config".into(), "--no-warnings".into(),
+        "--sleep-requests".into(), "0.8".into(),
+        "--socket-timeout".into(), "15".into(), "--retries".into(), "1".into(),
+        "--format".into(), "best[ext=mp4][vcodec!=none][acodec!=none]/best[protocol=https][vcodec!=none][acodec!=none]".into(),
+    ];
+    let cookie_file = cookie_file
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(&config.cookie_file);
+    if !cookie_file.is_empty() {
+        args.extend(["--cookies".into(), cookie_file.into()]);
+    }
     if !config.proxy.is_empty() {
         args.push("--proxy".into());
         args.push(config.proxy.clone());
     }
-    args.push(url.to_string());
+    args.extend(["--".into(), url.to_string()]);
 
     let mut candidates = vec![config.command.clone()];
     if let Some(bundled) = bundled_ytdlp() {
@@ -87,7 +104,15 @@ fn pick_direct_mp4s(formats: Option<&Vec<Value>>) -> Vec<VideoQuality> {
                 .get("protocol")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            !url.is_empty() && protocol.starts_with("http") && !url.contains(".m3u8")
+            !url.is_empty()
+                && matches!(protocol, "http" | "https")
+                && !url.contains(".m3u8")
+                && format.get("vcodec").and_then(Value::as_str) != Some("none")
+                && format.get("acodec").and_then(Value::as_str) != Some("none")
+                && format
+                    .get("ext")
+                    .and_then(Value::as_str)
+                    .is_none_or(|ext| ext == "mp4")
         })
         .map(|format| VideoQuality {
             quality: format
@@ -109,20 +134,20 @@ fn pick_direct_mp4s(formats: Option<&Vec<Value>>) -> Vec<VideoQuality> {
             bit_rate: format.get("tbr").and_then(Value::as_u64),
         })
         .collect();
-    videos.sort_by(|a, b| b.bit_rate.unwrap_or(0).cmp(&a.bit_rate.unwrap_or(0)));
+    videos.sort_by_key(|video| std::cmp::Reverse(video.bit_rate.unwrap_or(0)));
     videos
 }
 
 pub fn map_ytdlp_json(info: &Value) -> ParsedData {
-    if let Some(entries) = info.get("entries").and_then(Value::as_array) {
-        if let Some(entry) = entries.iter().find(|entry| {
+    if let Some(entries) = info.get("entries").and_then(Value::as_array)
+        && let Some(entry) = entries.iter().find(|entry| {
             entry
                 .get("formats")
                 .and_then(Value::as_array)
                 .is_some_and(|formats| !formats.is_empty())
-        }) {
-            return map_ytdlp_json(entry);
-        }
+        })
+    {
+        return map_ytdlp_json(entry);
     }
 
     let videos = pick_direct_mp4s(info.get("formats").and_then(Value::as_array));
@@ -176,6 +201,24 @@ pub fn map_ytdlp_json(info: &Value) -> ParsedData {
         .first()
         .map(|video| video.url.clone())
         .unwrap_or_default();
+    if parsed.video.is_empty()
+        && info.get("acodec").and_then(Value::as_str) != Some("none")
+        && info.get("vcodec").and_then(Value::as_str) != Some("none")
+        && info.get("ext").and_then(Value::as_str) == Some("mp4")
+    {
+        parsed.video = info
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    if let Some(headers) = info.get("http_headers").and_then(Value::as_object) {
+        for name in ["Referer", "User-Agent", "Origin"] {
+            if let Some(value) = headers.get(name).and_then(Value::as_str) {
+                parsed.media_headers.insert(name.into(), value.into());
+            }
+        }
+    }
     parsed.videos = videos;
     parsed.like = info.get("like_count").and_then(Value::as_i64).unwrap_or(0);
     parsed.share = info
@@ -423,65 +466,32 @@ pub fn map_syndication(data: &Value) -> ParsedData {
     parsed
 }
 
-async fn fetch_syndication(status_id: &str, config: &YtdlpConfig) -> anyhow::Result<ParsedData> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
-    if !config.proxy.is_empty() {
-        builder = builder.proxy(reqwest::Proxy::all(&config.proxy)?);
+pub async fn parse_native(http: &SiteHttp, url: &str) -> anyhow::Result<ParsedData> {
+    let status_id =
+        extract_twitter_status_id(url).ok_or_else(|| anyhow::anyhow!("X帖子链接格式错误"))?;
+    let endpoint =
+        format!("https://cdn.syndication.twimg.com/tweet-result?id={status_id}&token=x&lang=en");
+    let data = http.get_json(&endpoint, "twitter").await?;
+    let parsed = map_syndication(&data);
+    if !parsed.has_media() {
+        anyhow::bail!(
+            "X未返回公开媒体，请配置 auth.cookies.twitter，或为本地 yt-dlp 提供 Netscape Cookie 文件"
+        );
     }
-    let response = builder
-        .build()?
-        .get(format!(
-            "https://cdn.syndication.twimg.com/tweet-result?id={status_id}&token=x"
-        ))
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        )
-        .send()
-        .await?;
-    let status = response.status();
-    if status.as_u16() != 200 {
-        anyhow::bail!("syndication 接口返回异常: HTTP {}", status.as_u16());
-    }
-    let data: Value = response.json().await?;
-    if !data.is_object() {
-        anyhow::bail!("syndication 接口返回异常: 响应不是对象");
-    }
-    Ok(map_syndication(&data))
+    Ok(parsed)
 }
 
-pub async fn parse_twitter_local(url: &str, config: &YtdlpConfig) -> anyhow::Result<ParsedData> {
-    let status_id = extract_twitter_status_id(url);
-    let mut last_error: Option<String>;
-
-    match run_ytdlp_json(url, config).await {
-        Ok(info) => {
-            let parsed = map_ytdlp_json(&info);
-            if parsed.has_media() {
-                info!("yt-dlp 本地解析成功: {url}");
-                return Ok(parsed);
-            }
-            last_error = Some("yt-dlp 未解析出媒体内容".to_string());
-        }
-        Err(err) => {
-            last_error = Some(err.to_string());
-            debug!("yt-dlp 解析失败: {err}");
-        }
+pub async fn parse_ytdlp(
+    url: &str,
+    config: &YtdlpConfig,
+    cookie_file: Option<&str>,
+) -> anyhow::Result<ParsedData> {
+    let info = run_ytdlp_json(url, config, cookie_file).await?;
+    let parsed = map_ytdlp_json(&info);
+    if !parsed.has_media() {
+        anyhow::bail!("本地 yt-dlp 未获得带音轨的直链 MP4");
     }
-
-    if let Some(status_id) = status_id {
-        match fetch_syndication(&status_id, config).await {
-            Ok(parsed) => {
-                info!("syndication 兜底解析成功: {url}");
-                return Ok(parsed);
-            }
-            Err(err) => {
-                last_error = Some(err.to_string());
-                debug!("syndication 兜底失败: {err}");
-            }
-        }
-    }
-    anyhow::bail!("{}", last_error.unwrap_or_else(|| "本地解析失败".into()))
+    Ok(parsed)
 }
 
 #[cfg(test)]

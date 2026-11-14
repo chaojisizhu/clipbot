@@ -19,12 +19,11 @@ const WBI_MIXIN: [usize; 64] = [
 static WBI_CACHE: Lazy<Mutex<Option<(String, String, Instant)>>> = Lazy::new(|| Mutex::new(None));
 
 async fn get_wbi_keys(api_base: &str) -> anyhow::Result<(String, String)> {
-    if let Ok(cache) = WBI_CACHE.lock() {
-        if let Some((img, sub, expire)) = cache.as_ref() {
-            if Instant::now() < *expire {
-                return Ok((img.clone(), sub.clone()));
-            }
-        }
+    if let Ok(cache) = WBI_CACHE.lock()
+        && let Some((img, sub, expire)) = cache.as_ref()
+        && Instant::now() < *expire
+    {
+        return Ok((img.clone(), sub.clone()));
     }
     let client = reqwest::Client::builder()
         .timeout(CARD_REQUEST_TIMEOUT)
@@ -135,10 +134,10 @@ async fn search_bilibili(title: &str, api_base: &str) -> anyhow::Result<Option<(
     };
     for result in results.iter().take(3) {
         let hit_title = strip_em_tags(result["title"].as_str().unwrap_or_default());
-        if let Some(bvid) = result["bvid"].as_str() {
-            if title_likely_match(title, &hit_title) {
-                return Ok(Some((bvid.to_string(), hit_title)));
-            }
+        if let Some(bvid) = result["bvid"].as_str()
+            && title_likely_match(title, &hit_title)
+        {
+            return Ok(Some((bvid.to_string(), hit_title)));
         }
     }
     Ok(None)

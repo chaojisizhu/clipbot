@@ -1,0 +1,12 @@
+target
+.git
+dist
+config.yaml
+config.yml
+config.json
+cookies
+.env
+temp_videos
+temp_jm
+.tmp
+*.log

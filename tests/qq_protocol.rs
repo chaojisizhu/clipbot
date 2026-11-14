@@ -10,6 +10,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
@@ -31,6 +32,7 @@ struct MockState {
     ops: Arc<Mutex<Vec<Value>>>,
     ws_tx: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
     passive_limit: Arc<AtomicBool>,
+    cos_parts: Arc<Mutex<Vec<Vec<u8>>>>,
     http_base: String,
     ws_url: String,
 }
@@ -97,14 +99,13 @@ async fn websocket_loop(socket: WebSocket, state: MockState) {
             }
             inbound = receiver.next() => {
                 let Some(Ok(message)) = inbound else { break };
-                if let Message::Text(text) = message {
-                    if let Ok(payload) = serde_json::from_str::<Value>(&text) {
+                if let Message::Text(text) = message
+                    && let Ok(payload) = serde_json::from_str::<Value>(&text) {
                         state.ops.lock().await.push(payload.clone());
                         if payload.get("op").and_then(Value::as_u64) == Some(1) {
                             let _ = sender.send(Message::Text(json!({ "op": 11 }).to_string().into())).await;
                         }
                     }
-                }
             }
         }
     }
@@ -203,8 +204,13 @@ async fn upload_part_finish(
     Json(json!({}))
 }
 
-async fn cos_part(Path(_part): Path<String>, body: Bytes) -> &'static str {
+async fn cos_part(
+    State(state): State<MockState>,
+    Path(_part): Path<String>,
+    body: Bytes,
+) -> &'static str {
     assert!(!body.is_empty());
+    state.cos_parts.lock().await.push(body.to_vec());
     "{}"
 }
 
@@ -232,8 +238,7 @@ async fn wait_for_identify(state: &MockState) {
     .expect("identify timeout");
 }
 
-#[tokio::test]
-async fn gateway_reply_and_chunked_upload_protocol() {
+async fn start_mock() -> (MockState, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = MockState {
@@ -241,6 +246,7 @@ async fn gateway_reply_and_chunked_upload_protocol() {
         ops: Arc::new(Mutex::new(Vec::new())),
         ws_tx: Arc::new(Mutex::new(None)),
         passive_limit: Arc::new(AtomicBool::new(false)),
+        cos_parts: Arc::new(Mutex::new(Vec::new())),
         http_base: format!("http://{address}"),
         ws_url: format!("ws://{address}/ws"),
     };
@@ -260,7 +266,12 @@ async fn gateway_reply_and_chunked_upload_protocol() {
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
+    (state, server)
+}
 
+#[tokio::test]
+async fn gateway_reply_and_chunked_upload_protocol() {
+    let (state, server) = start_mock().await;
     let config = QQBotConfig {
         app_id: "test-app-id".into(),
         app_secret: "test-secret".into(),
@@ -371,6 +382,44 @@ async fn gateway_reply_and_chunked_upload_protocol() {
             .count(),
         4
     );
+    let memory_parts = state.cos_parts.lock().await.clone();
+    assert_eq!(memory_parts.concat(), b"hello world abc");
+
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("streamed.mp4");
+    tokio::fs::write(&path, b"hello world abc").await.unwrap();
+    let streamed = bot
+        .upload_group_media_file("GROUP001", 2, "streamed.mp4", &path)
+        .await
+        .unwrap();
+    assert_eq!(streamed["file_info"], "FILE_INFO_UPLOADED");
+    let calls = state.calls.lock().await.clone();
+    let streamed_prepare = calls
+        .iter()
+        .rev()
+        .find(|call| call.path.ends_with("/upload_prepare"))
+        .unwrap();
+    assert_eq!(streamed_prepare.body["file_size"], "15");
+    assert_eq!(
+        streamed_prepare.body["md5"],
+        format!("{:x}", md5::compute(b"hello world abc"))
+    );
+    assert_eq!(
+        streamed_prepare.body["md5_10m"],
+        streamed_prepare.body["md5"]
+    );
+    assert_eq!(
+        streamed_prepare.body["sha1"],
+        hex::encode(Sha1::digest(b"hello world abc"))
+    );
+    assert_eq!(&state.cos_parts.lock().await[4..], memory_parts.as_slice());
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.path.ends_with("/upload_part_finish"))
+            .count(),
+        8
+    );
 
     bot.reply(&event, &media_payload("FILE_INFO_UPLOADED"))
         .await
@@ -378,8 +427,7 @@ async fn gateway_reply_and_chunked_upload_protocol() {
     let calls = state.calls.lock().await;
     let last_message = calls
         .iter()
-        .filter(|call| call.path.ends_with("/messages"))
-        .last()
+        .rfind(|call| call.path.ends_with("/messages"))
         .unwrap();
     assert_eq!(last_message.body["msg_type"], 7);
     assert_eq!(
@@ -389,5 +437,85 @@ async fn gateway_reply_and_chunked_upload_protocol() {
 
     bot.stop();
     let _ = timeout(Duration::from_secs(2), bot_task).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn full_event_queue_keeps_gateway_heartbeats_running() {
+    let (state, server) = start_mock().await;
+    let bot = Arc::new(QQBotClient::new(QQBotConfig {
+        app_id: "test-app-id".into(),
+        app_secret: "test-secret".into(),
+        api_base: state.http_base.clone(),
+        ..QQBotConfig::default()
+    }));
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let bot_task = tokio::spawn(Arc::clone(&bot).run(events_tx));
+    wait_for_identify(&state).await;
+    push_event(
+        &state,
+        json!({
+            "op":0, "s":1, "t":"READY", "d":{"session_id":"full-queue", "user":{"username":"mock"}}
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(2), async {
+        while events_rx.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let heartbeat_count = state
+        .ops
+        .lock()
+        .await
+        .iter()
+        .filter(|op| op.get("op").and_then(Value::as_u64) == Some(1))
+        .count();
+    // All dispatch kinds encounter the full channel. None may suspend the
+    // gateway reader, which must continue sending heartbeats and reading ACKs.
+    push_event(
+        &state,
+        json!({
+            "op":0, "s":2, "t":"GROUP_MESSAGE_CREATE", "d":{
+                "id":"queue-msg-1", "group_openid":"GROUP001", "content":"queued message",
+                "author":{"username":"mock"}
+            }
+        }),
+    )
+    .await;
+    push_event(&state, json!({"op":0, "s":3, "t":"RESUMED", "d":{}})).await;
+    push_event(
+        &state,
+        json!({
+            "op":0, "s":4, "t":"READY", "d":{"session_id":"still-ready", "user":{"username":"mock"}}
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let count = state
+                .ops
+                .lock()
+                .await
+                .iter()
+                .filter(|op| op.get("op").and_then(Value::as_u64) == Some(1))
+                .count();
+            if count >= heartbeat_count + 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("full dispatch channel stalled gateway heartbeats");
+    assert_eq!(events_rx.len(), 1);
+    bot.stop();
+    timeout(Duration::from_secs(2), bot_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     server.abort();
 }
