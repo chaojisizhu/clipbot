@@ -273,67 +273,6 @@ pub async fn download_media_buffer_with_headers(
     bail!("媒体下载失败 {last_error}")
 }
 
-pub struct ImagePrefix {
-    pub bytes: Vec<u8>,
-    pub complete: bool,
-}
-
-/// Reads a bounded prefix from a newly uploaded image instead of another full copy.
-pub async fn fetch_image_prefix(url: &str, proxies: &[String]) -> Result<ImagePrefix> {
-    const MAX_PREFIX: usize = 64 * 1024;
-    check_url(url)?;
-    for client in clients(url, proxies) {
-        for attempt in 0..2 {
-            let result = async {
-                let response = client
-                    .get(url)
-                    .header(reqwest::header::RANGE, "bytes=0-65535")
-                    .timeout(Duration::from_secs(10))
-                    .send()
-                    .await?
-                    .error_for_status()?;
-                let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-                let total_size = if partial {
-                    response
-                        .headers()
-                        .get(reqwest::header::CONTENT_RANGE)
-                        .and_then(|header| header.to_str().ok())
-                        .filter(|range| range.starts_with("bytes 0-"))
-                        .and_then(|range| range.rsplit('/').next())
-                        .and_then(|total| total.parse::<u64>().ok())
-                } else {
-                    response.content_length()
-                };
-                let mut prefix = Vec::new();
-                let mut stream = response.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk?;
-                    let remaining = MAX_PREFIX - prefix.len();
-                    prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                    if prefix.len() == MAX_PREFIX {
-                        break;
-                    }
-                }
-                anyhow::ensure!(!prefix.is_empty(), "中转图片返回空内容");
-                let complete = total_size == Some(prefix.len() as u64)
-                    || !partial && prefix.len() < MAX_PREFIX;
-                Ok::<_, anyhow::Error>(ImagePrefix {
-                    bytes: prefix,
-                    complete,
-                })
-            }
-            .await;
-            if let Ok(prefix) = result {
-                return Ok(prefix);
-            }
-            if attempt == 0 {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-            }
-        }
-    }
-    bail!("QQ 中转图片地址暂时不可读取");
-}
-
 pub async fn head_content_length(url: &str, proxies: &[String]) -> u64 {
     if check_url(url).is_err() {
         return 0;

@@ -72,7 +72,8 @@ output:
   videoSendTimeout: 60000
   tempDir: "./temp_videos"
   maxVideoSize: 190
-  maxMarkdownImages: 9
+  # 单条图集最多显示的图片数量；0 使用默认值 30。
+  maxMarkdownImages: 30
   deduplicationInterval: 180
   # HLS/DASH 以本地 FFmpeg 直接封装，使用 -c copy 并限制单线程。
   ffmpegCommand: "ffmpeg"

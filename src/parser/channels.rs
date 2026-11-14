@@ -214,18 +214,36 @@ async fn yuanbao_parse(share_url: &str, cookie: &str, api_base: &str) -> anyhow:
         .send()
         .await?;
     let status = response.status();
-    let data: Value = response.json().await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("元宝登录态已过期，请重新登录元宝并更新 channels.yuanbaoCookie（HTTP 401）");
+    }
     if !status.is_success() {
         anyhow::bail!("元宝解析接口异常: HTTP {}", status.as_u16());
     }
-    let code = data.get("code").and_then(Value::as_i64).unwrap_or(0);
-    if data.get("error").is_some_and(|value| !value.is_null()) || code != 0 {
+    let data: Value = response
+        .json()
+        .await
+        .map_err(|_| anyhow::anyhow!("元宝解析接口返回无效 JSON 响应"))?;
+    let error_code = data.pointer("/error/code").and_then(numeric_code);
+    if error_code == Some(20002) {
         anyhow::bail!(
-            "元宝解析失败: {}",
-            data.to_string().chars().take(200).collect::<String>()
+            "元宝登录态已过期，请重新登录元宝并更新 channels.yuanbaoCookie（元宝错误码 20002）"
         );
     }
+    let code = data.get("code").and_then(numeric_code).unwrap_or(0);
+    if data.get("error").is_some_and(|value| !value.is_null()) || code != 0 {
+        if let Some(error_code) = error_code.or((code != 0).then_some(code)) {
+            anyhow::bail!("元宝解析失败: 错误码 {error_code}");
+        }
+        anyhow::bail!("元宝解析失败: 接口返回错误");
+    }
     Ok(data.get("data").cloned().unwrap_or(Value::Null))
+}
+
+fn numeric_code(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
 async fn fetch_feed_info(
@@ -465,17 +483,11 @@ pub async fn parse_channels_share(
         }
     }
     if general_token.is_empty() || export_id.is_empty() {
-        anyhow::bail!(
-            "playable_url 缺少 token/eid: {}",
-            playable.chars().take(120).collect::<String>()
-        );
+        anyhow::bail!("playable_url 缺少 token/eid");
     }
 
     let feed = fetch_feed_info(&export_id, &general_token, channels_base).await?;
-    debug!(
-        "视频号 feed 详情: {}",
-        feed.to_string().chars().take(500).collect::<String>()
-    );
+    debug!("视频号 feed 详情已获取");
     let mut result = map_feed_to_parsed(&feed);
     if result.cover.is_empty() {
         result.cover = parsed
@@ -511,6 +523,86 @@ pub async fn parse_channels_share(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn yuanbao_error_fixture(status: u16, response_body: &'static str) -> String {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::{Json, Router, routing::post};
+
+        const PRIVATE_COOKIE: &str =
+            "hy_user=fixture-private-user; hy_token=fixture-private-cookie";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/api/weixin/get_parse_result",
+            post(
+                move |headers: HeaderMap, Json(body): Json<Value>| async move {
+                    assert_eq!(headers["cookie"], PRIVATE_COOKIE);
+                    assert_eq!(headers["x-webversion"], "2.69.0");
+                    assert_eq!(body["type"], "video_channel_url");
+                    assert_eq!(body["scene"], 1);
+                    (StatusCode::from_u16(status).unwrap(), response_body)
+                },
+            ),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let error = yuanbao_parse("https://weixin.qq.com/sph/fixture", PRIVATE_COOKIE, &base)
+            .await
+            .unwrap_err()
+            .to_string();
+        server.abort();
+        assert!(
+            !error.contains("fixture-private"),
+            "error leaked fixture secret"
+        );
+        assert!(!error.contains(PRIVATE_COOKIE));
+        error
+    }
+
+    #[tokio::test]
+    async fn yuanbao_401_json_requests_cookie_renewal_without_echoing_credentials() {
+        let error = yuanbao_error_fixture(
+            401,
+            r#"{"error":{"code":20002,"message":"fixture-private-body","hy_token":"fixture-private-token"}}"#,
+        )
+        .await;
+        assert_eq!(
+            error,
+            "元宝登录态已过期，请重新登录元宝并更新 channels.yuanbaoCookie（HTTP 401）"
+        );
+    }
+
+    #[tokio::test]
+    async fn yuanbao_401_html_requests_cookie_renewal_before_json_decode() {
+        let error = yuanbao_error_fixture(
+            401,
+            "<html>fixture-private-body and fixture-private-cookie</html>",
+        )
+        .await;
+        assert!(error.contains("重新登录元宝并更新 channels.yuanbaoCookie"));
+        assert!(error.contains("HTTP 401"));
+    }
+
+    #[tokio::test]
+    async fn yuanbao_200_business_auth_error_requests_cookie_renewal() {
+        for body in [
+            r#"{"error":{"code":20002,"message":"fixture-private-body"}}"#,
+            r#"{"error":{"code":"20002","message":"fixture-private-body"}}"#,
+        ] {
+            let error = yuanbao_error_fixture(200, body).await;
+            assert!(error.contains("重新登录元宝并更新 channels.yuanbaoCookie"));
+            assert!(error.contains("20002"));
+        }
+    }
+
+    #[tokio::test]
+    async fn yuanbao_other_errors_report_only_safe_error_code() {
+        let error = yuanbao_error_fixture(
+            200,
+            r#"{"error":{"code":20003,"message":"fixture-private-body","url":"https://example.com/?token=fixture-private-token"}}"#,
+        )
+        .await;
+        assert_eq!(error, "元宝解析失败: 错误码 20003");
+    }
 
     #[test]
     fn isaac64_matches_go_reference_vector() {

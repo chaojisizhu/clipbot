@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::types::{ImageSize, ParsedData, QQImageAttachment};
+use crate::types::{DEFAULT_MAX_MARKDOWN_IMAGES, ImageSize, ParsedData, QQImageAttachment};
 
 static URL_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https?://[^\s"'<>\\]+"#).unwrap());
 static IMAGE_EXT_RE: Lazy<Regex> =
@@ -51,7 +51,7 @@ pub struct MarkdownOptions {
 
 pub fn build_result_markdown(data: &ParsedData, text: &str, options: &MarkdownOptions) -> String {
     let max_images = if options.max_images == 0 {
-        9
+        DEFAULT_MAX_MARKDOWN_IMAGES
     } else {
         options.max_images
     };

@@ -199,6 +199,7 @@ async fn run_bot(config: AppConfig, parser: Arc<VideoParserService>) -> Result<(
     let config = Arc::new(config);
     let bot = Arc::new(QQBotClient::new(config.qqbot.clone()));
     let state = Arc::new(AppState::new(config, parser, Arc::clone(&bot)));
+    state.cleanup_markdown_materials().await;
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     let mut bot_task = tokio::spawn(Arc::clone(&bot).run(tx));
     let mut workers = JoinSet::new();

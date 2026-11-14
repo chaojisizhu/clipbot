@@ -79,7 +79,7 @@ Docker 登录需要可写 Cookie 目录，可使用 `docker run --rm -it --mount
 - 视频流式落盘，QQ 上传使用 64 KiB 缓冲与逐片哈希。视频号仅处理前 128 KiB 加密前缀。
 - 下载、合流和上传结束后通过文件所有权守卫清理临时媒体。正常失败、超时、任务取消均有清理路径。
 - 原生视频单文件默认 190 MiB，活动临时媒体默认合计 512 MiB。合流前预留输出预算，超限结果会失败并清理。
-- 图片中转每张最多 20 MiB，OpenAI 图片溯源按配置最多 50 MiB，并发为 1。附属 JM 的限页、字节预算及流式打包单独管理。
+- 图集素材每张最多 10 MB，逐张上传；OpenAI 图片溯源按配置最多 50 MiB，并发为 1。附属 JM 的限页、字节预算及流式打包单独管理。
 
 开源原站协议、会话与限流处理的参考链接收录在 [平台记录](docs/PLATFORMS.md)。测量结果和已知限制收录在 [验证记录](docs/VALIDATION.md)。
 
@@ -101,10 +101,12 @@ MIT 许可证覆盖 Rust 项目，保留原接入代码的授权声明。Docker 
 
 ## 图集输出
 
-图集会将文字与本次图片合成一条 Markdown 消息，默认最多 9 张。程序读取 PNG、JPEG、GIF、WebP 的实际编码元信息及 EXIF 方向，按宽度最多 750 像素等比声明显示尺寸。源图逐个下载、上传，内存中的单张图片上限为 20 MiB。
+图集会将文字与本次图片合成一条 Markdown 消息，默认最多 30 张，可通过 `output.maxMarkdownImages` 调整；0 使用默认值 30。程序读取 PNG、JPEG、GIF、WebP 的实际编码元信息及 EXIF 方向，按宽度最多 750 像素等比声明显示尺寸。图片逐个下载，单张上限为官方素材接口的 10 MB，处理过程中不解码像素或重新编码。
 
-上传后检查中转图链及其显示尺寸。64 KiB 前缀不能确认后置方向信息时，在同一大小限制内补取完整中转文件。渲染不进行像素解码或重编码。中转地址仅用于当前回复，仍受平台图链有效期和 QQ 客户端缓存影响。
+图片通过 QQ 专用素材 API `media-images/prepare`、预签名 PUT 和 `media-images/complete` 上传，Markdown 使用返回的 `qqbot-media://image/v1/...` 引用。图片资源强校验保持开启，准备失败和配置截断会在图文中显示数量，最终拒绝会另发明确失败提示。
 
-Markdown 开启图片转存结果校验。QQ 明确返回图片转存错误时，最多再用一次原站图链发送整篇图文。最终失败会显示未发送的图片数量，准备失败和配置截断也会在图文中标明。手机与 PC 的最终显示效果需要实际客户端验证。
+成功发送后，仅删除本项目本批创建的素材。官方说明已发送消息保存了图片副本，删除素材不影响该消息。本项目素材所有权记录保存在媒体临时目录的 `.allvideo-markdown-materials.json` 中，重启或后续图集会继续清理到期记录。网络结果未确认的素材先保留五分钟，避免影响可能仍在处理的消息。损坏记录会阻止继续创建素材并返回提示。
 
-尺寸和消息格式参考官方 SDK，转存失败分类参考实际开源联调记录。[官方尺寸实现](https://github.com/tencent-connect/qqbot-nodejs/blob/main/src/protocol/utils/image-size.ts) [官方图片行为](https://github.com/tencent-connect/bot-docs/blob/main/docs/develop/api-v2/server-inter/message/type/markdown.md) [El Bot 转存实测](https://docs.bot.elpsy.cn/development/codex-remote.html) [多图 Markdown 示例](https://github.com/Teahouse-Studios/qq-botpy-sdk/blob/master/examples/demo_group_reply_markdown_image.py)
+富媒体上传的临时 HTTP 图链与 X 原站图链在实际 Markdown 强校验中均返回过 `40034141`，因此图集使用专用素材引用。手机与 PC 的最终显示效果仍由实际 QQ 客户端决定。
+
+素材协议与尺寸格式参考官方文档和开源实现。[官方素材管理](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/material-management.html) [官方尺寸实现](https://github.com/tencent-connect/qqbot-nodejs/blob/main/src/protocol/utils/image-size.ts) [Gensokyo 素材实现](https://github.com/Te-River/Gensokyo-NewQQ/blob/main/handlers/media_asset.go) [El Bot 转存实测](https://docs.bot.elpsy.cn/development/codex-remote.html)

@@ -7,6 +7,7 @@ pub mod http;
 pub mod image_dimensions;
 pub mod jmcomic;
 pub mod matcher;
+pub mod materials;
 pub mod media;
 pub mod process;
 pub mod remux;

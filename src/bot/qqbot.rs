@@ -26,6 +26,32 @@ const PASSIVE_FALLBACK_CODES: &[i64] = &[40_034_128, 40_034_005, 40_034_026, 304
 const DUPLICATE_SEQ_CODE: i64 = 40_054_005;
 const UPLOAD_BUFFER_SIZE: usize = 64 * 1024;
 const UPLOAD_HEAD_SIZE: u64 = 10_002_432;
+pub const MARKDOWN_IMAGE_MAX_BYTES: usize = 10_000_000;
+
+#[derive(Debug, Clone)]
+pub struct MarkdownImage {
+    pub image_id: String,
+    pub url: String,
+}
+
+fn valid_markdown_image_id(image_id: &str) -> bool {
+    !image_id.is_empty()
+        && image_id != "."
+        && image_id != ".."
+        && !image_id.chars().any(char::is_whitespace)
+        && !image_id.chars().any(char::is_control)
+}
+
+fn valid_markdown_image_url(image_url: &str) -> bool {
+    image_url
+        .strip_prefix("qqbot-media://image/v1/")
+        .is_some_and(|token| {
+            !token.is_empty()
+                && token.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'=' | b'~')
+                })
+        })
+}
 
 struct UploadPart {
     index: u64,
@@ -831,6 +857,169 @@ impl QQBotClient {
             Duration::from_secs(120),
         )
         .await
+    }
+
+    /// Upload a Markdown material, rather than a native media message attachment.
+    pub async fn upload_markdown_image(
+        &self,
+        file_name: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> Result<MarkdownImage, QQBotError> {
+        self.upload_markdown_image_tracked(file_name, content_type, data, |_| Ok(()))
+            .await
+    }
+
+    /// The callback records the created ID before response validation or any cleanup await.
+    pub async fn upload_markdown_image_tracked(
+        &self,
+        file_name: &str,
+        content_type: &str,
+        data: &[u8],
+        on_created: impl FnOnce(&str) -> Result<(), QQBotError>,
+    ) -> Result<MarkdownImage, QQBotError> {
+        if data.is_empty() || data.len() > MARKDOWN_IMAGE_MAX_BYTES {
+            return Err(QQBotError::Other(
+                "Markdown 图片不能为空或超过 10 MB".into(),
+            ));
+        }
+        if file_name.is_empty() || file_name.chars().any(char::is_control) {
+            return Err(QQBotError::Other("Markdown 图片文件名无效".into()));
+        }
+        let extension = Path::new(file_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let expected_type = match extension.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => return Err(QQBotError::Other("Markdown 图片格式不支持".into())),
+        };
+        if content_type != expected_type {
+            return Err(QQBotError::Other(
+                "Markdown 图片扩展名与 Content-Type 不一致".into(),
+            ));
+        }
+        let prepared = self
+            .api_call(
+                reqwest::Method::POST,
+                "/v2/media-images/prepare",
+                Some(&json!({
+                    "file_name": file_name,
+                    "file_size": data.len(),
+                    "content_type": content_type,
+                    "md5": format!("{:x}", md5::compute(data)),
+                    "sha1": hex::encode(Sha1::digest(data)),
+                })),
+                false,
+                Duration::from_secs(120),
+            )
+            .await?;
+        let upload_id = prepared
+            .get("upload_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && !id.chars().any(char::is_control))
+            .ok_or_else(|| QQBotError::Other("素材上传响应缺少有效 upload_id".into()))?;
+        let presigned_url = prepared
+            .get("presigned_url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.chars().any(char::is_control))
+            .ok_or_else(|| QQBotError::Other("素材上传响应缺少有效预签名 URL".into()))?;
+        let parsed = url::Url::parse(presigned_url)
+            .map_err(|_| QQBotError::Other("素材预签名 URL 无效".into()))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(QQBotError::Other(
+                "素材预签名 URL 必须为无认证信息的 HTTP(S) 地址".into(),
+            ));
+        }
+        let uploaded = self
+            .upload_http
+            .put(parsed)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .header(reqwest::header::CONTENT_LENGTH, data.len())
+            .body(data.to_vec())
+            .send()
+            .await?
+            .error_for_status()?;
+        let etag = uploaded
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| {
+                value
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .unwrap_or(value)
+            })
+            .filter(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| QQBotError::Other("素材上传响应缺少有效 MD5 ETag".into()))?
+            .to_ascii_lowercase();
+        drop(uploaded);
+        let completed = self
+            .api_call(
+                reqwest::Method::POST,
+                "/v2/media-images/complete",
+                Some(&json!({"upload_id": upload_id, "md5": etag})),
+                false,
+                Duration::from_secs(120),
+            )
+            .await?;
+        let image_id = completed
+            .get("image_id")
+            .and_then(Value::as_str)
+            .filter(|id| valid_markdown_image_id(id))
+            .ok_or_else(|| QQBotError::Other("素材上传响应缺少有效 image_id".into()))?;
+        if let Err(error) = on_created(image_id) {
+            if let Err(cleanup_error) = self.delete_markdown_image(image_id).await {
+                warn!("素材所有权记录失败后，清理本次素材暂未完成: {cleanup_error}");
+            }
+            return Err(error);
+        }
+        let image_url = completed
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| valid_markdown_image_url(url));
+        let Some(image_url) = image_url else {
+            // The material already exists even when its reference is unusable.
+            if let Err(error) = self.delete_markdown_image(image_id).await {
+                warn!("素材图片引用无效，清理本次已创建素材失败: {error}");
+            }
+            return Err(QQBotError::Other(
+                "素材上传响应缺少有效 qqbot-media 图片引用".into(),
+            ));
+        };
+        Ok(MarkdownImage {
+            image_id: image_id.to_owned(),
+            url: image_url.to_owned(),
+        })
+    }
+
+    /// Delete only a material ID tracked by the caller's own upload ledger.
+    pub async fn delete_markdown_image(&self, image_id: &str) -> Result<(), QQBotError> {
+        if !valid_markdown_image_id(image_id) {
+            return Err(QQBotError::Other("待清理的 Markdown 素材 ID 无效".into()));
+        }
+        match self
+            .api_call(
+                reqwest::Method::DELETE,
+                &format!("/v2/media-images/{}/delete", urlencoding::encode(image_id)),
+                None,
+                false,
+                Duration::from_secs(30),
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(QQBotError::Api(error)) if error.err_code == 40_035_008 => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn upload_user_media(

@@ -14,7 +14,7 @@ use crate::bot::message::{
     MarkdownOptions, build_result_markdown, markdown_payload, media_payload, quoted_text_payload,
     text_payload,
 };
-use crate::bot::qqbot::{QQBotClient, QQBotError};
+use crate::bot::qqbot::{MARKDOWN_IMAGE_MAX_BYTES, QQBotClient, QQBotError};
 use crate::parser::api::VideoParserService;
 use crate::parser::cardsearch::resolve_card_by_title;
 use crate::parser::formatter::generate_formatted_text;
@@ -22,15 +22,17 @@ use crate::parser::gpt_detect::{
     GPT_DETECT_BUSY_TEXT, GPT_DETECT_WAITING_TEXT, detect_openai_image, format_gpt_detect_error,
     format_gpt_detect_reply, matches_gpt_detect_keyword,
 };
-use crate::parser::image_dimensions::{markdown_size, probe_image, probe_image_prefix};
+use crate::parser::image_dimensions::{markdown_size, probe_image};
 use crate::parser::jmcomic::{cleanup_jm_zip, extract_jm_id};
 use crate::parser::matcher::link_type_parser;
+use crate::parser::materials::{OwnedMaterials, unix_now};
 use crate::parser::media::{
-    download_media_buffer, download_media_buffer_with_headers, fetch_image_prefix,
-    head_content_length, is_foreign_url,
+    download_media_buffer_with_headers, head_content_length, is_foreign_url,
 };
 use crate::parser::remux::download_parsed_temp;
-use crate::types::{AppConfig, ChatType, ImageSize, LinkMatch, ParsedData, QQChatEvent};
+use crate::types::{
+    AppConfig, ChatType, DEFAULT_MAX_MARKDOWN_IMAGES, ImageSize, LinkMatch, ParsedData, QQChatEvent,
+};
 
 static ARCHIVE_EXT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\.(7z|zip)$").unwrap());
 static JM_TASK_GATE: Semaphore = Semaphore::const_new(1);
@@ -42,13 +44,14 @@ pub struct AppState {
     dedup_cache: Arc<std::sync::Mutex<HashMap<String, DedupEntry>>>,
     gpt_detect_busy: AtomicBool,
     local_proxies: Vec<String>,
+    gallery_material_gate: tokio::sync::Mutex<()>,
+    owned_materials: std::sync::Mutex<Result<OwnedMaterials, String>>,
 }
 
 struct GalleryImage {
-    source_url: String,
-    source_size: ImageSize,
-    relay_url: String,
-    relay_size: ImageSize,
+    image_id: String,
+    url: String,
+    size: ImageSize,
 }
 
 struct DedupEntry {
@@ -121,6 +124,8 @@ impl AppState {
         if !config.api.proxy.is_empty() && !local_proxies.contains(&config.api.proxy) {
             local_proxies.push(config.api.proxy.clone());
         }
+        let owned_materials = OwnedMaterials::new(Path::new(&config.output.temp_dir))
+            .map_err(|error| format!("{error:#}"));
         Self {
             config,
             parser,
@@ -128,6 +133,8 @@ impl AppState {
             dedup_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             gpt_detect_busy: AtomicBool::new(false),
             local_proxies,
+            gallery_material_gate: tokio::sync::Mutex::new(()),
+            owned_materials: std::sync::Mutex::new(owned_materials),
         }
     }
 
@@ -502,27 +509,6 @@ impl AppState {
         })
     }
 
-    async fn upload_media_data(
-        &self,
-        event: &QQChatEvent,
-        file_type: u32,
-        file_name: &str,
-        data: &[u8],
-    ) -> anyhow::Result<Value> {
-        Ok(match event.chat_type {
-            ChatType::Group => {
-                self.bot
-                    .upload_group_media_data(&event.chat_id, file_type, file_name, data)
-                    .await?
-            }
-            ChatType::Private => {
-                self.bot
-                    .upload_user_media_data(&event.chat_id, file_type, file_name, data)
-                    .await?
-            }
-        })
-    }
-
     async fn upload_media_file(
         &self,
         event: &QQChatEvent,
@@ -728,14 +714,92 @@ impl AppState {
         transfer_succeeded && delivered
     }
 
+    pub async fn cleanup_markdown_materials(&self) {
+        let _gate = self.gallery_material_gate.lock().await;
+        self.cleanup_due_materials().await;
+    }
+
+    fn with_materials<T>(
+        &self,
+        operation: impl FnOnce(&mut OwnedMaterials) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut state = self
+            .owned_materials
+            .lock()
+            .map_err(|_| anyhow::anyhow!("素材记录锁不可用"))?;
+        let owned = state
+            .as_mut()
+            .map_err(|error| anyhow::anyhow!("素材记录不可用: {error}"))?;
+        operation(owned)
+    }
+
+    async fn cleanup_due_materials(&self) {
+        let ids = match self.with_materials(|owned| {
+            if owned.is_dirty() {
+                owned.flush()?;
+            }
+            Ok(owned.due(unix_now()?))
+        }) {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!("读取待清理素材失败: {error}");
+                return;
+            }
+        };
+        if ids.is_empty() {
+            return;
+        }
+        let cleanup = async {
+            for id in ids {
+                match self.bot.delete_markdown_image(&id).await {
+                    Ok(()) => {
+                        if let Err(error) = self
+                            .with_materials(|owned| owned.mark_removed(std::slice::from_ref(&id)))
+                        {
+                            warn!("更新素材清理记录失败: {error}");
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        warn!("本项目 Markdown 素材清理暂未完成: {error}");
+                        break;
+                    }
+                }
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(10), cleanup)
+            .await
+            .is_err()
+        {
+            warn!("本项目素材清理达到时间上限，保留记录供后续重试");
+        }
+    }
+
+    async fn release_gallery_materials(&self, ids: &[String]) {
+        if let Err(error) = self.with_materials(|owned| owned.mark_due(ids, 0)) {
+            warn!("记录本批素材清理期限失败: {error}");
+        }
+        self.cleanup_due_materials().await;
+    }
+
     async fn send_gallery_result(
         &self,
         event: &QQChatEvent,
         parsed: &ParsedData,
         text: &str,
     ) -> bool {
+        // The account may deduplicate material IDs. Keep ownership, publication and
+        // deletion in one bounded gallery turn so another reply cannot lose its material.
+        let _gate = self.gallery_material_gate.lock().await;
+        self.cleanup_due_materials().await;
+        if let Err(error) = self.with_materials(|owned| owned.ensure_capacity(1)) {
+            warn!("图集暂不可创建素材: {error}");
+            self.send_message(event, text_payload("⚠️ 图集素材状态暂不可用，请稍后重试。"))
+                .await;
+            return false;
+        }
         let max_images = if self.config.output.max_markdown_images == 0 {
-            9
+            DEFAULT_MAX_MARKDOWN_IMAGES
         } else {
             self.config.output.max_markdown_images
         };
@@ -750,66 +814,79 @@ impl AppState {
         };
         let selected_count = sources.len().min(max_images);
         let omitted_count = sources.len() - selected_count;
+        info!(
+            total_images = sources.len(),
+            selected_images = selected_count,
+            omitted_images = omitted_count,
+            configured_limit = max_images,
+            "图集图片数量已核对"
+        );
+        let prior_ids = self
+            .with_materials(|owned| {
+                Ok(owned
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect::<Vec<_>>())
+            })
+            .unwrap_or_default();
         let mut images = Vec::with_capacity(selected_count);
         for (index, source) in sources.into_iter().take(selected_count).enumerate() {
             match self
-                .prepare_gallery_image(event, source, &parsed.media_headers)
+                .prepare_gallery_image(source, &parsed.media_headers)
                 .await
             {
                 Ok(image) => images.push(image),
-                Err(error) => warn!(image_index = index + 1, "图集图片准备失败: {error}"),
+                Err(error) => warn!(image_index = index + 1, "图集图片素材准备失败: {error}"),
             }
         }
+        let releasable: Vec<String> = images
+            .iter()
+            .filter(|image| !prior_ids.contains(&image.image_id))
+            .map(|image| image.image_id.clone())
+            .collect();
         let failed_count = selected_count - images.len();
-        let markdown = self.gallery_markdown(text, &images, false, failed_count, omitted_count);
-        let result = self
+        let markdown = self.gallery_markdown(text, &images, failed_count, omitted_count);
+        match self
             .bot
             .reply(event, &markdown_payload(markdown, !images.is_empty()))
-            .await;
-        let result = match result {
+            .await
+        {
             Ok(_) => {
                 info!(
-                    "图集 Markdown 已发送，{} 张图片，{} 张准备失败",
+                    "图集素材 Markdown 已发送，{} 张图片，{} 张准备失败，{} 张受配置上限限制",
                     images.len(),
-                    failed_count
+                    failed_count,
+                    omitted_count
                 );
-                return failed_count == 0 && !images.is_empty();
-            }
-            Err(QQBotError::Api(error))
-                if !images.is_empty()
-                    && [304003, 304010, 40034004, 40034141].contains(&error.err_code) =>
-            {
-                warn!(
-                    "Markdown 图片转存失败 (err_code: {})，改用原站图链重试一次",
-                    error.err_code
-                );
-                let markdown =
-                    self.gallery_markdown(text, &images, true, failed_count, omitted_count);
-                self.bot
-                    .reply(event, &markdown_payload(markdown, true))
-                    .await
-            }
-            other => other,
-        };
-        match result {
-            Ok(_) => {
-                info!(
-                    "原站图链 Markdown 已发送，{} 张图片，{} 张准备失败",
-                    images.len(),
-                    failed_count
-                );
-                failed_count == 0
+                // QQ stores a sent-message copy, so owned materials can be deleted
+                // after its successful acknowledgement without breaking that message.
+                self.release_gallery_materials(&releasable).await;
+                failed_count == 0 && !images.is_empty()
             }
             Err(error) => {
-                warn!("图集 Markdown 发送未完成: {error}");
+                warn!("图集素材 Markdown 发送未完成: {error}");
                 let notice = match error {
-                    QQBotError::Api(error) => format!(
-                        "⚠️ 图集发送失败，本次 {selected_count} 张图片未发送，请稍后重试。（QQ 错误码 {}）",
-                        error.err_code
-                    ),
-                    QQBotError::Other(_) => format!(
-                        "⚠️ 图集发送结果未确认，本次共 {selected_count} 张图片，请检查群内显示，缺少时再重试。"
-                    ),
+                    QQBotError::Api(error) => {
+                        self.release_gallery_materials(&releasable).await;
+                        format!(
+                            "⚠️ 图集发送失败，本次 {selected_count} 张图片未发送，请稍后重试。（QQ 错误码 {}）",
+                            error.err_code
+                        )
+                    }
+                    QQBotError::Other(_) => {
+                        let ids: Vec<String> =
+                            images.iter().map(|image| image.image_id.clone()).collect();
+                        let deadline = unix_now().unwrap_or(0).saturating_add(300);
+                        if let Err(error) =
+                            self.with_materials(|owned| owned.mark_due(&ids, deadline))
+                        {
+                            warn!("延后清理未确认素材的记录更新失败: {error}");
+                        }
+                        format!(
+                            "⚠️ 图集发送结果未确认，本次共 {selected_count} 张图片，请检查群内显示，缺少时再重试。"
+                        )
+                    }
                 };
                 self.send_message(event, text_payload(notice)).await;
                 false
@@ -821,22 +898,17 @@ impl AppState {
         &self,
         text: &str,
         images: &[GalleryImage],
-        source_urls: bool,
         failed_count: usize,
         omitted_count: usize,
     ) -> String {
         let mut gallery = ParsedData::empty("image");
-        let mut sizes = HashMap::new();
-        for image in images {
-            let (url, size) = if source_urls {
-                (&image.source_url, &image.source_size)
-            } else {
-                (&image.relay_url, &image.relay_size)
-            };
-            gallery.images.push(url.clone());
-            sizes.insert(url.clone(), size.clone());
-        }
-        gallery.image_size_map = Some(sizes);
+        gallery.images = images.iter().map(|image| image.url.clone()).collect();
+        gallery.image_size_map = Some(
+            images
+                .iter()
+                .map(|image| (image.url.clone(), image.size.clone()))
+                .collect(),
+        );
         let mut markdown = build_result_markdown(
             &gallery,
             text,
@@ -847,7 +919,7 @@ impl AppState {
             },
         );
         if failed_count > 0 {
-            markdown.push_str(&format!("\n⚠️ {failed_count} 张图片准备失败，未发送。"));
+            markdown.push_str(&format!("\n⚠️ {failed_count} 张图片准备失败，未发送。支持 PNG/JPEG/GIF/WebP，单张上限 10 MB。"));
         }
         if omitted_count > 0 {
             markdown.push_str(&format!(
@@ -862,62 +934,36 @@ impl AppState {
 
     async fn prepare_gallery_image(
         &self,
-        event: &QQChatEvent,
         image: &str,
         headers: &HashMap<String, String>,
     ) -> anyhow::Result<GalleryImage> {
+        self.with_materials(|owned| owned.ensure_capacity(1))?;
         let buffer = download_media_buffer_with_headers(
             image,
             &self.local_proxies,
-            20 * 1024 * 1024,
+            MARKDOWN_IMAGE_MAX_BYTES as u64,
             headers,
         )
         .await?;
-        let original = probe_image(&buffer)?;
-        let name = format!("img_{}.{}", random_suffix(12), original.extension);
-        let source_bytes = buffer.len();
-        let upload = self.upload_media_data(event, 1, &name, &buffer).await?;
-        drop(buffer);
-        let relay_url = upload
-            .get("raw_url")
-            .and_then(Value::as_str)
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("图片上传缺少 raw_url"))?;
-        let parsed_url = url::Url::parse(relay_url)?;
-        anyhow::ensure!(
-            matches!(parsed_url.scheme(), "http" | "https")
-                && parsed_url.host_str().is_some()
-                && parsed_url.username().is_empty()
-                && parsed_url.password().is_none(),
-            "图片中转地址无效"
-        );
-        let prefix = fetch_image_prefix(relay_url, &self.local_proxies).await?;
-        let relay = if prefix.complete {
-            Some(probe_image(&prefix.bytes)?)
-        } else {
-            probe_image_prefix(&prefix.bytes)?
-        };
-        let relay = match relay {
-            Some(metadata) => metadata,
-            None => {
-                drop(prefix);
-                let bytes =
-                    download_media_buffer(relay_url, &self.local_proxies, 20 * 1024 * 1024).await?;
-                probe_image(&bytes)?
-            }
-        };
+        let metadata = probe_image(&buffer)?;
+        let name = format!("img_{}.{}", random_suffix(12), metadata.extension);
+        let uploaded = self
+            .bot
+            .upload_markdown_image_tracked(&name, metadata.mime_type, &buffer, |id| {
+                self.with_materials(|owned| owned.track(id))
+                    .map_err(QQBotError::from)
+            })
+            .await?;
         info!(
-            "图集图片已中转，{} KiB，格式 {}，显示尺寸 {}×{}",
-            source_bytes / 1024,
-            original.mime_type,
-            relay.size.width,
-            relay.size.height
+            "图集图片素材已创建，{} KiB，显示尺寸 {}×{}",
+            buffer.len() / 1024,
+            metadata.size.width,
+            metadata.size.height
         );
         Ok(GalleryImage {
-            source_url: image.to_owned(),
-            source_size: markdown_size(&original.size),
-            relay_url: relay_url.to_owned(),
-            relay_size: markdown_size(&relay.size),
+            image_id: uploaded.image_id,
+            url: uploaded.url,
+            size: markdown_size(&metadata.size),
         })
     }
 }

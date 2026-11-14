@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_MAX_MARKDOWN_IMAGES: usize = 30;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct QQBotConfig {
@@ -149,7 +151,7 @@ impl Default for OutputConfig {
             temp_dir: "./temp_videos".into(),
             max_video_size: 0,
             deduplication_interval: 180,
-            max_markdown_images: 9,
+            max_markdown_images: DEFAULT_MAX_MARKDOWN_IMAGES,
             format: concat!(
                 "标题：${标题}\n作者：${作者}\n简介：${简介}\n时长：${视频时长}\n",
                 "点赞：${点赞数}\n收藏：${收藏数}\n转发：${转发数}\n播放：${播放数}\n",
