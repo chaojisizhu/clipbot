@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::bot::message::{
     extract_card_fields, extract_current_text_from_qq_event, extract_quoted_content_from_qq_event,
-    extract_text_from_qq_event,
+    extract_text_from_qq_event, strip_leading_self_mentions,
 };
 use crate::types::{BotEvent, ChatType, QQApiError, QQBotConfig, QQChatEvent};
 
@@ -38,28 +38,34 @@ fn upload_parts(prepare: &Value, file_size: u64) -> anyhow::Result<Vec<UploadPar
     let parts = prepare
         .get("parts")
         .and_then(Value::as_array)
-        .filter(|parts| !parts.is_empty() && parts.len() <= 4096)
-        .ok_or_else(|| anyhow::anyhow!("upload_prepare 分片列表为空或过长"))?;
-    let mut offset = 0u64;
+        .filter(|parts| parts.len() <= 4096)
+        .ok_or_else(|| anyhow::anyhow!("upload_prepare 分片列表缺失或过长"))?;
+    if parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let block_size = prepare
+        .get("block_size")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .filter(|size| *size > 0)
+        .ok_or_else(|| anyhow::anyhow!("upload_prepare 分片大小必须为正整数"))?;
     let mut indices = std::collections::HashSet::new();
     let mut result = Vec::with_capacity(parts.len());
-    for (position, part) in parts.iter().enumerate() {
+    for part in parts {
         let index = part
             .get("index")
             .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("分片缺少合法 index"))?;
-        let block = part
-            .get("block_size")
-            .and_then(value_to_i64)
-            .filter(|block| *block > 0)
-            .ok_or_else(|| anyhow::anyhow!("分片大小必须为正整数"))? as u64;
+            .filter(|index| *index > 0)
+            .ok_or_else(|| anyhow::anyhow!("分片 index 必须为从 1 开始的正整数"))?;
+        if !indices.insert(index) {
+            anyhow::bail!("分片编号重复");
+        }
+        let offset = (index - 1)
+            .checked_mul(block_size)
+            .ok_or_else(|| anyhow::anyhow!("分片范围溢出"))?;
         let remaining = file_size
             .checked_sub(offset)
             .filter(|remaining| *remaining > 0)
             .ok_or_else(|| anyhow::anyhow!("分片超过文件范围"))?;
-        if !indices.insert(index) || (block > remaining && position + 1 != parts.len()) {
-            anyhow::bail!("分片编号重复或分片范围错误");
-        }
         let url = part
             .get("presigned_url")
             .and_then(Value::as_str)
@@ -68,19 +74,12 @@ fn upload_parts(prepare: &Value, file_size: u64) -> anyhow::Result<Vec<UploadPar
         if !matches!(parsed.scheme(), "http" | "https") {
             anyhow::bail!("分片上传 URL 必须为 HTTP(S)");
         }
-        let length = block.min(remaining);
         result.push(UploadPart {
             index,
             url: url.into(),
             offset,
-            length,
+            length: block_size.min(remaining),
         });
-        offset = offset
-            .checked_add(length)
-            .ok_or_else(|| anyhow::anyhow!("分片范围溢出"))?;
-    }
-    if offset != file_size {
-        anyhow::bail!("分片总长度与文件长度不一致");
     }
     Ok(result)
 }
@@ -125,6 +124,7 @@ pub struct QQBotClient {
     token: Mutex<TokenState>,
     token_refresh_lock: Mutex<()>,
     session_id: Mutex<Option<String>>,
+    bot_user_id: Mutex<Option<String>>,
     last_seq: Mutex<Option<i64>>,
     reply_seqs: Mutex<HashMap<String, (u64, Instant)>>,
     seen_message_ids: Mutex<HashMap<String, Instant>>,
@@ -149,6 +149,7 @@ impl QQBotClient {
             token: Mutex::new(TokenState::default()),
             token_refresh_lock: Mutex::new(()),
             session_id: Mutex::new(None),
+            bot_user_id: Mutex::new(None),
             last_seq: Mutex::new(None),
             reply_seqs: Mutex::new(HashMap::new()),
             seen_message_ids: Mutex::new(HashMap::new()),
@@ -415,6 +416,7 @@ impl QQBotClient {
                                 })
                                 .filter(|value| *value > 0)
                                 .unwrap_or(45_000);
+                            debug!(heartbeat_interval_ms = interval_ms, "QQ 网关 Hello");
                             missed_acks = 0;
                             if let Err(err) = self.ensure_token(true).await {
                                 error!("刷新 access_token 失败: {err}，稍后重试");
@@ -473,7 +475,10 @@ impl QQBotClient {
                             timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
                             heartbeat = Some(timer);
                         }
-                        11 => missed_acks = 0,
+                        11 => {
+                            missed_acks = 0;
+                            debug!("QQ 网关心跳 ACK 已收到");
+                        }
                         7 => {
                             warn!("服务端要求重新连接，将走 Resume 流程");
                             return ConnectionOutcome {
@@ -530,6 +535,7 @@ impl QQBotClient {
         data: &Value,
         events: &mpsc::Sender<BotEvent>,
     ) {
+        debug!(dispatch_type, "QQ 网关事件已收到");
         if dispatch_type == "READY" {
             let session_id = data
                 .get("session_id")
@@ -537,6 +543,11 @@ impl QQBotClient {
                 .unwrap_or_default()
                 .to_string();
             *self.session_id.lock().await = (!session_id.is_empty()).then_some(session_id.clone());
+            *self.bot_user_id.lock().await = data.pointer("/user/id").and_then(|id| match id {
+                Value::String(text) if !text.is_empty() => Some(text.clone()),
+                Value::Number(number) => Some(number.to_string()),
+                _ => None,
+            });
             self.reconnect_attempts.store(0, Ordering::SeqCst);
             info!(
                 "✔ 登录鉴权成功！机器人: {} (session: {session_id})",
@@ -565,7 +576,10 @@ impl QQBotClient {
             "C2C_MESSAGE_CREATE" => ChatType::Private,
             _ => return,
         };
-        let Some(event) = self.normalize_message_event(chat_type, data).await else {
+        let Some(event) = self
+            .normalize_message_event(chat_type, dispatch_type, data)
+            .await
+        else {
             return;
         };
         {
@@ -608,20 +622,50 @@ impl QQBotClient {
     async fn normalize_message_event(
         &self,
         chat_type: ChatType,
+        dispatch_type: &str,
         data: &Value,
     ) -> Option<QQChatEvent> {
-        let message_id = data.get("id").filter(|id| json_truthy(id))?;
-        let message_id = match message_id {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        };
+        let message_id = data.get("id").filter(|id| json_truthy(id));
         let chat_id = match chat_type {
             ChatType::Group => data.get("group_openid"),
             ChatType::Private => data.pointer("/author/user_openid"),
         }
         .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())?
-        .to_string();
+        .filter(|value| !value.is_empty());
+        let (Some(message_id), Some(chat_id)) = (message_id, chat_id) else {
+            debug!(
+                dispatch_type,
+                missing_message_id = message_id.is_none(),
+                missing_chat_id = chat_id.is_none(),
+                "QQ 消息缺少必需字段"
+            );
+            return None;
+        };
+        let message_id = match message_id {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let chat_id = chat_id.to_string();
+        let raw_current_text = extract_current_text_from_qq_event(data);
+        let raw_text = extract_text_from_qq_event(data);
+        let bot_user_id = self.bot_user_id.lock().await.clone();
+        let self_ids = [
+            bot_user_id.as_deref().unwrap_or_default(),
+            &self.config.app_id,
+        ];
+        let (current_text, current_mention_removed) =
+            strip_leading_self_mentions(&raw_current_text, &self_ids);
+        let (text, aggregate_mention_removed) = strip_leading_self_mentions(&raw_text, &self_ids);
+        let received_chars = data
+            .get("content")
+            .and_then(Value::as_str)
+            .map_or(0, |text| text.chars().count());
+        debug!(
+            dispatch_type,
+            received_chars,
+            self_mention_removed = current_mention_removed || aggregate_mention_removed,
+            "QQ 消息正文已规范化"
+        );
         let quoted = extract_quoted_content_from_qq_event(data);
         if let Some(ark) = data.get("ark_data") {
             let fields = ark
@@ -663,8 +707,8 @@ impl QQBotClient {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            current_text: extract_current_text_from_qq_event(data),
-            text: extract_text_from_qq_event(data),
+            current_text: current_text.to_owned(),
+            text: text.to_owned(),
             card_title,
             card_source,
             quoted_message_id: quoted.message_id,
@@ -912,7 +956,7 @@ impl QQBotClient {
                 &format!("{base_path}/upload_prepare"),
                 Some(&json!({
                     "file_type": file_type,
-                    "file_size": size.to_string(),
+                    "file_size": size,
                     "file_name": file_name,
                     "md5": format!("{:x}", md5_whole.compute()),
                     "sha1": hex::encode(sha1.finalize()),
@@ -977,7 +1021,7 @@ impl QQBotClient {
                 Some(&json!({
                     "upload_id": upload_id,
                     "part_index": part.index,
-                    "block_size": part.length.to_string(),
+                    "block_size": part.length,
                     "md5": format!("{:x}", block_md5.compute())
                 })),
                 false,
@@ -988,12 +1032,7 @@ impl QQBotClient {
         self.api_call(
             reqwest::Method::POST,
             &format!("{base_path}/files"),
-            Some(&json!({
-                "file_type": file_type,
-                "srv_send_msg": false,
-                "file_name": file_name,
-                "upload_id": upload_id
-            })),
+            Some(&json!({ "upload_id": upload_id })),
             false,
             Duration::from_secs(30),
         )
@@ -1017,7 +1056,7 @@ impl QQBotClient {
                 &format!("{base_path}/upload_prepare"),
                 Some(&json!({
                     "file_type": file_type,
-                    "file_size": data.len().to_string(),
+                    "file_size": data.len(),
                     "file_name": file_name,
                     "md5": md5_whole,
                     "sha1": sha1,
@@ -1058,7 +1097,7 @@ impl QQBotClient {
                 Some(&json!({
                     "upload_id": upload_id,
                     "part_index": index,
-                    "block_size": chunk.len().to_string(),
+                    "block_size": chunk.len(),
                     "md5": chunk_md5
                 })),
                 false,
@@ -1069,12 +1108,7 @@ impl QQBotClient {
         self.api_call(
             reqwest::Method::POST,
             &format!("{base_path}/files"),
-            Some(&json!({
-                "file_type": file_type,
-                "srv_send_msg": false,
-                "file_name": file_name,
-                "upload_id": upload_id
-            })),
+            Some(&json!({ "upload_id": upload_id })),
             false,
             Duration::from_secs(30),
         )
@@ -1195,20 +1229,53 @@ mod tests {
 
     #[test]
     fn rejects_invalid_upload_part_ranges() {
-        let part = |index, size| {
+        let part = |index| {
             json!({
-                "index": index, "block_size": size, "presigned_url": "https://cos.example/part"
+                "index": index, "presigned_url": "https://cos.example/part"
             })
         };
-        assert!(upload_parts(&json!({"parts":[part(0, 0)]}), 15).is_err());
-        assert!(upload_parts(&json!({"parts":[part(0, 4)]}), 15).is_err());
-        assert!(upload_parts(&json!({"parts":[part(0, 16),part(1, 4)]}), 15).is_err());
-        assert!(upload_parts(&json!({"parts":[part(0, 8),part(0, 8)]}), 15).is_err());
-        let too_many: Vec<_> = (0..4097).map(|index| part(index, 1)).collect();
-        assert!(upload_parts(&json!({"parts":too_many}), 4097).is_err());
-        let parts = upload_parts(&json!({"parts":[part(0, 8),part(1, i64::MAX)]}), 15).unwrap();
-        assert_eq!(parts[1].length, 7);
-        assert_eq!(parts[1].offset, 8);
+        assert!(upload_parts(&json!({"block_size":8,"parts":[part(0)]}), 15).is_err());
+        assert!(upload_parts(&json!({"block_size":0,"parts":[part(1)]}), 15).is_err());
+        assert!(upload_parts(&json!({"block_size":-1,"parts":[part(1)]}), 15).is_err());
+        assert!(upload_parts(&json!({"parts":[part(1)]}), 15).is_err());
+        assert!(upload_parts(&json!({"block_size":8,"parts":[part(3)]}), 15).is_err());
+        assert!(upload_parts(&json!({"block_size":8,"parts":[part(1),part(1)]}), 15).is_err());
+        assert!(upload_parts(&json!({"block_size":8,"parts":[part(u64::MAX)]}), 15).is_err());
+        let too_many: Vec<_> = (1..=4097).map(part).collect();
+        assert!(upload_parts(&json!({"block_size":1,"parts":too_many}), 4097).is_err());
+        assert!(upload_parts(&json!({}), 15).is_err());
+    }
+
+    #[test]
+    fn upload_parts_use_indices_for_partial_and_unordered_requests() {
+        let prepare = json!({"block_size":"4","parts":[
+            {"index":4,"presigned_url":"https://cos.example/last"},
+            {"index":2,"presigned_url":"https://cos.example/second"}
+        ]});
+        let parts = upload_parts(&prepare, 15).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            (parts[0].index, parts[0].offset, parts[0].length),
+            (4, 12, 3)
+        );
+        assert_eq!(
+            (parts[1].index, parts[1].offset, parts[1].length),
+            (2, 4, 4)
+        );
+        assert!(upload_parts(&json!({"parts":[]}), 15).unwrap().is_empty());
+        assert!(
+            upload_parts(&json!({"block_size":0,"parts":[]}), 15)
+                .unwrap()
+                .is_empty()
+        );
+        let whole = upload_parts(
+            &json!({"block_size":u64::MAX,"parts":[
+                {"index":1,"presigned_url":"https://cos.example/full"}
+            ]}),
+            15,
+        )
+        .unwrap();
+        assert_eq!((whole[0].offset, whole[0].length), (0, 15));
     }
     use crate::bot::message::{media_payload, quoted_text_payload, text_payload};
 

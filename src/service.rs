@@ -127,7 +127,7 @@ impl AppState {
             return;
         }
 
-        let raw_text = event.text.clone();
+        let raw_text = event.text.trim_start().to_string();
         if raw_text.trim().is_empty() {
             return;
         }

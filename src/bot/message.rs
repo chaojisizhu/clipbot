@@ -236,6 +236,26 @@ pub fn extract_current_text_from_qq_event(data: &Value) -> String {
         .to_string()
 }
 
+pub fn strip_leading_self_mentions<'a>(text: &'a str, self_ids: &[&str]) -> (&'a str, bool) {
+    let mut remaining = text;
+    let mut removed = false;
+    while let Some(mention) = remaining.trim_start().strip_prefix("<@") {
+        let mention = mention.strip_prefix('!').unwrap_or(mention);
+        let Some((id, following)) = mention.split_once('>') else {
+            break;
+        };
+        if !self_ids
+            .iter()
+            .any(|expected| !expected.is_empty() && id == *expected)
+        {
+            break;
+        }
+        remaining = following.trim_start();
+        removed = true;
+    }
+    (remaining, removed)
+}
+
 fn collect_urls_from_fields(fields: &Value) -> Vec<String> {
     let Some(object) = fields.as_object() else {
         return Vec::new();
@@ -305,6 +325,38 @@ pub fn extract_card_fields(data: &Value) -> (Option<String>, Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strips_only_leading_mentions_of_this_robot() {
+        let own_ids = ["654321", "123456"];
+        for text in [
+            "<@654321> 解析 链接",
+            "  <@!654321>\n\t解析 链接",
+            "<@123456>解析 链接",
+            "<@!123456><@654321> 解析 链接",
+        ] {
+            assert_eq!(
+                strip_leading_self_mentions(text, &own_ids),
+                ("解析 链接", true)
+            );
+        }
+        assert_eq!(
+            strip_leading_self_mentions("<@!654321> <@other> 解析 <@123456>", &own_ids),
+            ("<@other> 解析 <@123456>", true)
+        );
+        for text in [
+            "  <@other> <@654321> 解析 链接",
+            "解析 <@654321> 链接",
+            "<@!> 解析 链接",
+            "<@654321 解析 链接",
+        ] {
+            assert_eq!(strip_leading_self_mentions(text, &own_ids), (text, false));
+        }
+        assert_eq!(
+            strip_leading_self_mentions("<@> 解析", &[""]),
+            ("<@> 解析", false)
+        );
+    }
 
     #[test]
     fn extracts_nested_and_escaped_links() {

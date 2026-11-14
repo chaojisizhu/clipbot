@@ -16,7 +16,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 use videorust::bot::message::{media_payload, text_payload};
 use videorust::bot::qqbot::{INTENT_GROUP_AND_C2C, QQBotClient};
-use videorust::types::{BotEvent, QQBotConfig};
+use videorust::parser::api::VideoParserService;
+use videorust::service::AppState;
+use videorust::types::{AppConfig, BotEvent, QQBotConfig};
 
 #[derive(Clone, Debug)]
 struct RequestLog {
@@ -168,6 +170,7 @@ async fn upload_prepare(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Json<Value> {
+    let already_uploaded = body.get("file_name").and_then(Value::as_str) == Some("cached.mp4");
     record(
         &state,
         "/v2/groups/GROUP001/upload_prepare".into(),
@@ -176,14 +179,22 @@ async fn upload_prepare(
         body,
     )
     .await;
+    if already_uploaded {
+        return Json(json!({"upload_id":"upload-test-cached","parts":[]}));
+    }
+    let parts = [4, 1, 3, 2]
+        .into_iter()
+        .map(|index| {
+            json!({
+                "index": index,
+                "presigned_url": format!("{}/cos/{index}", state.http_base)
+            })
+        })
+        .collect::<Vec<_>>();
     Json(json!({
         "upload_id": "upload-test-1",
-        "block_size": "4",
-        "parts": (0..4).map(|index| json!({
-            "index": index,
-            "presigned_url": format!("{}/cos/{index}", state.http_base),
-            "block_size": "4"
-        })).collect::<Vec<_>>()
+        "block_size": 4,
+        "parts": parts
     }))
 }
 
@@ -370,7 +381,7 @@ async fn gateway_reply_and_chunked_upload_protocol() {
         .iter()
         .find(|call| call.path.ends_with("/upload_prepare"))
         .unwrap();
-    assert_eq!(prepare.body["file_size"], "15");
+    assert_eq!(prepare.body["file_size"], 15);
     assert_eq!(
         prepare.body["md5"],
         format!("{:x}", md5::compute(b"hello world abc"))
@@ -383,7 +394,28 @@ async fn gateway_reply_and_chunked_upload_protocol() {
         4
     );
     let memory_parts = state.cos_parts.lock().await.clone();
-    assert_eq!(memory_parts.concat(), b"hello world abc");
+    assert_eq!(
+        memory_parts,
+        [
+            b"abc".to_vec(),
+            b"hell".to_vec(),
+            b"rld ".to_vec(),
+            b"o wo".to_vec()
+        ]
+    );
+    let finishes: Vec<_> = calls
+        .iter()
+        .filter(|call| call.path.ends_with("/upload_part_finish"))
+        .collect();
+    for (call, (index, length)) in finishes.iter().zip([(4, 3), (1, 4), (3, 4), (2, 4)]) {
+        assert_eq!(call.body["part_index"], index);
+        assert_eq!(call.body["block_size"], length);
+    }
+    let complete = calls
+        .iter()
+        .rfind(|call| call.path.ends_with("/files"))
+        .unwrap();
+    assert_eq!(complete.body, json!({"upload_id":"upload-test-1"}));
 
     let temporary = tempfile::tempdir().unwrap();
     let path = temporary.path().join("streamed.mp4");
@@ -399,7 +431,7 @@ async fn gateway_reply_and_chunked_upload_protocol() {
         .rev()
         .find(|call| call.path.ends_with("/upload_prepare"))
         .unwrap();
-    assert_eq!(streamed_prepare.body["file_size"], "15");
+    assert_eq!(streamed_prepare.body["file_size"], 15);
     assert_eq!(
         streamed_prepare.body["md5"],
         format!("{:x}", md5::compute(b"hello world abc"))
@@ -420,6 +452,19 @@ async fn gateway_reply_and_chunked_upload_protocol() {
             .count(),
         8
     );
+
+    let cached = bot
+        .upload_group_media_data("GROUP001", 2, "cached.mp4", b"hello world abc")
+        .await
+        .unwrap();
+    assert_eq!(cached["file_info"], "FILE_INFO_UPLOADED");
+    assert_eq!(state.cos_parts.lock().await.len(), 8);
+    let calls = state.calls.lock().await.clone();
+    let complete = calls
+        .iter()
+        .rfind(|call| call.path.ends_with("/files"))
+        .unwrap();
+    assert_eq!(complete.body, json!({"upload_id":"upload-test-cached"}));
 
     bot.reply(&event, &media_payload("FILE_INFO_UPLOADED"))
         .await
@@ -511,6 +556,191 @@ async fn full_event_queue_keeps_gateway_heartbeats_running() {
     .await
     .expect("full dispatch channel stalled gateway heartbeats");
     assert_eq!(events_rx.len(), 1);
+    bot.stop();
+    timeout(Duration::from_secs(2), bot_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn mentioned_manual_commands_reach_message_handler_with_auto_parse_disabled() {
+    let (state, server) = start_mock().await;
+    let config = AppConfig {
+        qqbot: QQBotConfig {
+            app_id: "123456".into(),
+            app_secret: "test-secret".into(),
+            api_base: state.http_base.clone(),
+            receive_all_messages: false,
+            auto_parse: false,
+            command_prefix: vec!["解析".into()],
+            show_waiting_tip: false,
+            ..QQBotConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    let expected_reply = config.ui_text.invalid_link_text.clone();
+    let config = Arc::new(config);
+    let bot = Arc::new(QQBotClient::new(config.qqbot.clone()));
+    let parser = Arc::new(VideoParserService::new((*config).clone()).unwrap());
+    let app = Arc::new(AppState::new(config, parser, Arc::clone(&bot)));
+    let (events_tx, mut events_rx) = mpsc::channel(32);
+    let bot_task = tokio::spawn(Arc::clone(&bot).run(events_tx));
+    wait_for_identify(&state).await;
+
+    let mut sequence = 0;
+    let mut expected_messages = 0;
+    for ready_id in [json!("654321"), json!(987654321u64)] {
+        sequence += 1;
+        push_event(
+            &state,
+            json!({
+                "op":0, "s":sequence, "t":"READY",
+                "d":{"session_id":"mention-session", "user":{"id":ready_id,"username":"mock"}}
+            }),
+        )
+        .await;
+        assert!(matches!(
+            timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap(),
+            Some(BotEvent::Ready(_))
+        ));
+        let own_id = ready_id
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| ready_id.to_string());
+        for mention in [
+            format!("<@{own_id}>"),
+            format!("<@!{own_id}>"),
+            "<@123456>".into(),
+            "<@!123456>".into(),
+        ] {
+            sequence += 1;
+            push_event(
+                &state,
+                json!({
+                    "op":0, "s":sequence, "t":"GROUP_AT_MESSAGE_CREATE", "d":{
+                        "id":format!("mention-{sequence}"), "group_openid":"GROUP001",
+                        "content":format!(" \n{mention}\t 解析 没有链接"),
+                        "author":{"username":"mock"}
+                    }
+                }),
+            )
+            .await;
+            let Some(BotEvent::Message(event)) = timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap()
+            else {
+                panic!("expected normalized mentioned command");
+            };
+            assert_eq!(event.current_text, "解析 没有链接");
+            assert_eq!(event.text, "解析 没有链接");
+            Arc::clone(&app).handle_message(event).await;
+            expected_messages += 1;
+            let calls = state.calls.lock().await;
+            let messages = calls
+                .iter()
+                .filter(|call| call.path.ends_with("/messages"))
+                .collect::<Vec<_>>();
+            assert_eq!(messages.len(), expected_messages);
+            assert_eq!(messages.last().unwrap().body["content"], expected_reply);
+        }
+
+        sequence += 1;
+        let foreign_content = format!("<@other> 解析 没有链接 <@!{own_id}>");
+        push_event(
+            &state,
+            json!({
+                "op":0, "s":sequence, "t":"GROUP_AT_MESSAGE_CREATE", "d":{
+                    "id":format!("foreign-{sequence}"), "group_openid":"GROUP001",
+                    "content":foreign_content, "author":{"username":"mock"}
+                }
+            }),
+        )
+        .await;
+        let Some(BotEvent::Message(event)) = timeout(Duration::from_secs(2), events_rx.recv())
+            .await
+            .unwrap()
+        else {
+            panic!("expected message preserving other mentions");
+        };
+        assert_eq!(event.current_text, foreign_content);
+        assert_eq!(event.text, foreign_content);
+        Arc::clone(&app).handle_message(event).await;
+        assert_eq!(
+            state
+                .calls
+                .lock()
+                .await
+                .iter()
+                .filter(|call| call.path.ends_with("/messages"))
+                .count(),
+            expected_messages
+        );
+    }
+
+    sequence += 1;
+    push_event(
+        &state,
+        json!({
+            "op":0,"s":sequence,"t":"GROUP_AT_MESSAGE_CREATE","d":{
+                "id":"whitespace-command","group_openid":"GROUP001",
+                "content":" \n\t解析 没有链接","author":{"username":"mock"}
+            }
+        }),
+    )
+    .await;
+    let Some(BotEvent::Message(event)) = timeout(Duration::from_secs(2), events_rx.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected whitespace command");
+    };
+    Arc::clone(&app).handle_message(event).await;
+    expected_messages += 1;
+    let calls = state.calls.lock().await.clone();
+    let messages = calls
+        .iter()
+        .filter(|call| call.path.ends_with("/messages"))
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), expected_messages);
+    assert_eq!(messages.last().unwrap().body["content"], expected_reply);
+
+    sequence += 1;
+    push_event(
+        &state,
+        json!({
+            "op":0, "s":sequence, "t":"GROUP_AT_MESSAGE_CREATE", "d":{
+                "id":"nested-mentioned-command", "group_openid":"GROUP001",
+                "content":"<@!123456>", "msg_elements":[{"content":"解析 没有链接"}],
+                "author":{"username":"mock"}
+            }
+        }),
+    )
+    .await;
+    let Some(BotEvent::Message(event)) = timeout(Duration::from_secs(2), events_rx.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected aggregate command");
+    };
+    assert!(event.current_text.is_empty());
+    assert_eq!(event.text, "解析 没有链接");
+    Arc::clone(&app).handle_message(event).await;
+    assert_eq!(
+        state
+            .calls
+            .lock()
+            .await
+            .iter()
+            .filter(|call| call.path.ends_with("/messages"))
+            .count(),
+        expected_messages + 1
+    );
+
     bot.stop();
     timeout(Duration::from_secs(2), bot_task)
         .await
