@@ -59,7 +59,7 @@ Linux 交付目录可运行 `./start.sh login bilibili`。用 B站 App 扫描生
 
 Docker 登录需要可写 Cookie 目录，可使用 `docker run --rm -it --mount type=bind,source=<Cookie目录绝对路径>,target=/app/cookies allvideo:local login bilibili`。
 
-当前默认关闭微博、YouTube 与知乎，可在 `platformEnable` 查看开关。小红书使用 `auth.cookies.xiaohongshu`，完整分享链接需保留 `xsec_token`。X 登录态使用 Netscape 文件，在 `auth.cookieFiles.twitter` 配置后启用 `ytdlp.enabled`，认证提取将优先使用本机 yt-dlp。
+当前默认关闭微博、YouTube、知乎、Instagram 与 TikTok，可在 `platformEnable` 查看开关。小红书使用 `auth.cookies.xiaohongshu`，完整分享链接需保留 `xsec_token`。X 登录态使用 Netscape 文件，在 `auth.cookieFiles.twitter` 配置后启用 `ytdlp.enabled`，认证提取将优先使用本机 yt-dlp。
 
 
 按平台在 `auth.cookies` 填写浏览器完整 Cookie，或在 `auth.cookieFiles` 指向 Netscape 格式文件。Cookie 文件按域名、路径、HTTPS 标志和过期时间匹配。小红书分享链接需要保留 `xsec_token`。抖音移动分享域 `iesdouyin.com` 的 Cookie 需要在 Cookie 文件中对应此域配置。
@@ -96,3 +96,5 @@ cargo test python_zipfile_can_decrypt_generated_archive -- --ignored
 ```
 
 MIT 许可证覆盖 Rust 项目，保留原接入代码的授权声明。Docker 中 FFmpeg 的源码版本、校验摘要及编译参数可在 Dockerfile 查阅，其源码提供于 FFmpeg 官方发布目录。[FFmpeg 源码](https://ffmpeg.org/releases/)
+
+生产环境的目录、服务和验证结果见 [生产部署](docs/PRODUCTION.md)。

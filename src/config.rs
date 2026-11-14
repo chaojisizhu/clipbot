@@ -120,6 +120,8 @@ api:
         assert!(!cfg.platform_enabled("weibo"));
         assert!(!cfg.platform_enabled("youtube"));
         assert!(!cfg.platform_enabled("zhihu"));
+        assert!(!cfg.platform_enabled("instagram"));
+        assert!(!cfg.platform_enabled("tiktok"));
         let explicitly_enabled: AppConfig =
             serde_yaml::from_str("platformEnable: {zhihu: true}").unwrap();
         assert!(explicitly_enabled.platform_enabled("zhihu"));

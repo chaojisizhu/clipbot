@@ -1,0 +1,29 @@
+[Unit]
+Description=AllVideo QQ media parser
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=allvideo
+Group=allvideo
+WorkingDirectory=/opt/allvideo
+ExecStart=/opt/allvideo/start.sh bot
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+UMask=0077
+Environment=RUST_LOG=info
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/allvideo/cookies /opt/allvideo/temp_videos /opt/allvideo/temp_jm
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=64
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+
+[Install]
+WantedBy=multi-user.target

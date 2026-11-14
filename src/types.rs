@@ -308,7 +308,7 @@ impl Default for AppConfig {
         ] {
             platform_enable.insert(name.into(), true);
         }
-        for name in ["weibo", "youtube", "zhihu"] {
+        for name in ["weibo", "youtube", "zhihu", "instagram", "tiktok"] {
             platform_enable.insert(name.into(), false);
         }
         Self {
@@ -332,7 +332,10 @@ impl AppConfig {
         self.platform_enable
             .get(platform)
             .copied()
-            .unwrap_or(!matches!(platform, "weibo" | "youtube" | "zhihu"))
+            .unwrap_or(!matches!(
+                platform,
+                "weibo" | "youtube" | "zhihu" | "instagram" | "tiktok"
+            ))
     }
 }
 

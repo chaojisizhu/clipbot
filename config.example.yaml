@@ -92,6 +92,8 @@ platformEnable:
   weibo: false
   youtube: false
   zhihu: false
+  instagram: false
+  tiktok: false
 
 # 原项目附属功能，按需启用。extras 镜像包含 JM 所需 Python 工具。
 jmcomic:
