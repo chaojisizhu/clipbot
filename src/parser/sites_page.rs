@@ -51,9 +51,9 @@ impl std::error::Error for DouyinMediaUnavailable {}
 /// Read only data delivered by the original site's public page.
 pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedData> {
     if platform == "douyin"
-        && let Some(id) = douyin_slides_id(url)
+        && let Some(id) = douyin_gallery_id(url)
     {
-        return parse_douyin_slides(http, url, &id).await;
+        return parse_douyin_gallery(http, url, &id).await;
     }
     if platform == "douyin"
         && let Some(id) = douyin_id(url)
@@ -92,8 +92,13 @@ pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedD
     Ok(parsed)
 }
 
-async fn parse_douyin_slides(http: &SiteHttp, url: &str, id: &str) -> Result<ParsedData> {
-    let share_url = format!("https://www.iesdouyin.com/share/slides/{id}/");
+async fn parse_douyin_gallery(http: &SiteHttp, url: &str, id: &str) -> Result<ParsedData> {
+    let kind = if douyin_slides_id(url).is_some() {
+        "slides"
+    } else {
+        "note"
+    };
+    let share_url = format!("https://www.iesdouyin.com/share/{kind}/{id}/");
     let page_url = if Url::parse(url).ok().is_some_and(|url| {
         url.host_str()
             .is_some_and(|host| domain_matches(host, "iesdouyin.com"))
@@ -121,7 +126,7 @@ async fn parse_douyin_slides(http: &SiteHttp, url: &str, id: &str) -> Result<Par
         other => other,
     };
     let signed_detail = match douyin_web_detail(http, id).await {
-        Ok(Some(mut data)) if data.live_photo.len() == data.images.len() => {
+        Ok(Some(mut data)) if douyin_detail_complete(&data) => {
             set_media_headers(&mut data, "https://www.douyin.com/", "douyin");
             data.media_headers
                 .insert("User-Agent".into(), douyin_sign::WEB_USER_AGENT.into());
@@ -217,6 +222,11 @@ async fn parse_douyin_slides(http: &SiteHttp, url: &str, id: &str) -> Result<Par
     };
     set_media_headers(&mut parsed, page_url, "douyin");
     Ok(parsed)
+}
+
+fn douyin_detail_complete(data: &ParsedData) -> bool {
+    !data.images.is_empty()
+        && (data.media_type != "live_photo" || data.live_photo.len() == data.images.len())
 }
 
 async fn douyin_web_detail(http: &SiteHttp, id: &str) -> Result<Option<ParsedData>> {
@@ -397,6 +407,12 @@ pub(super) fn douyin_slides_id(url: &str) -> Option<String> {
     let url = Url::parse(url).ok()?;
     let (kind, id) = douyin_work_path(&url)?;
     (kind == "slides").then(|| id.to_owned())
+}
+
+fn douyin_gallery_id(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    let (kind, id) = douyin_work_path(&url)?;
+    matches!(kind, "note" | "slides").then(|| id.to_owned())
 }
 
 fn douyin_work_path(url: &Url) -> Option<(&str, &str)> {
@@ -1727,6 +1743,39 @@ mod tests {
             douyin_id("https://www.douyin.com/user/current?modal_id=123").as_deref(),
             Some("123")
         );
+    }
+
+    #[test]
+    fn douyin_notes_and_slides_use_the_gallery_route() {
+        for url in [
+            "https://www.iesdouyin.com/share/note/123/",
+            "https://www.iesdouyin.com/share/slides/123/",
+            "https://www.douyin.com/note/123",
+            "https://www.douyin.com/slides/123",
+        ] {
+            assert_eq!(douyin_gallery_id(url).as_deref(), Some("123"));
+        }
+        assert!(douyin_gallery_id("https://www.douyin.com/video/123").is_none());
+        assert!(douyin_gallery_id("https://www.douyin.com/note/123/more").is_none());
+    }
+
+    #[test]
+    fn signed_static_gallery_is_complete_without_a_pc_page_retry() {
+        let mut work = json!({"aweme_detail": {
+            "aweme_id":"123", "images":[{"url_list":["https://example.com/1.webp"]}]
+        }});
+        let static_gallery = map_douyin_web_detail(&work, "123").unwrap();
+        assert_eq!(static_gallery.media_type, "image");
+        assert!(static_gallery.video.is_empty() && static_gallery.live_photo.is_empty());
+        assert!(douyin_detail_complete(&static_gallery));
+        work["aweme_detail"]["images"][0]["live_photo_type"] = json!(1);
+        let missing_clip = map_douyin_web_detail(&work, "123").unwrap();
+        assert_eq!(missing_clip.media_type, "live_photo");
+        assert!(!douyin_detail_complete(&missing_clip));
+        work["aweme_detail"]["images"][0]["video"] =
+            json!({"play_addr":{"url_list":["https://example.com/1.mp4"]}});
+        let live_gallery = map_douyin_web_detail(&work, "123").unwrap();
+        assert!(douyin_detail_complete(&live_gallery));
     }
 
     #[test]
