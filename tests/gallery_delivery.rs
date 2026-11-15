@@ -7,13 +7,13 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
+use clipbot::bot::qqbot::QQBotClient;
+use clipbot::parser::api::VideoParserService;
+use clipbot::service::AppState;
+use clipbot::types::{AppConfig, ChatType, QQChatEvent};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use videorust::bot::qqbot::QQBotClient;
-use videorust::parser::api::VideoParserService;
-use videorust::service::AppState;
-use videorust::types::{AppConfig, ChatType, QQChatEvent};
 
 struct ImageFixture {
     bytes: Vec<u8>,

@@ -3,14 +3,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use clipbot::bot::qqbot::QQBotClient;
+use clipbot::config::load_config;
+use clipbot::parser::api::{ParseResult, VideoParserService};
+use clipbot::parser::matcher::link_type_parser;
+use clipbot::parser::remux::{download_live_album_temp, download_parsed_temp};
+use clipbot::service::AppState;
+use clipbot::types::{AppConfig, BotEvent};
 use tokio::task::JoinSet;
-use videorust::bot::qqbot::QQBotClient;
-use videorust::config::load_config;
-use videorust::parser::api::{ParseResult, VideoParserService};
-use videorust::parser::matcher::link_type_parser;
-use videorust::parser::remux::{download_live_album_temp, download_parsed_temp};
-use videorust::service::AppState;
-use videorust::types::{AppConfig, BotEvent};
 
 #[tokio::main(worker_threads = 2)]
 async fn main() -> std::process::ExitCode {
@@ -30,12 +30,12 @@ async fn run() -> Result<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "AllVideo Rust\n\n用法\n  videorust [--config config.yaml] bot\n  videorust [--config config.yaml] parse <分享链接>...\n  videorust [--config config.yaml] probe <分享链接>\n  videorust [--config config.yaml] check\n  videorust [--config config.yaml] login bilibili [--cookie-file 路径] [--qr-file 路径] [--timeout-seconds 180]\n\nparse 输出 JSON。probe 解析并流式下载校验，随后清理文件。默认命令为 bot。"
+            "ClipBot Rust\n\n用法\n  clipbot [--config config.yaml] bot\n  clipbot [--config config.yaml] parse <分享链接>...\n  clipbot [--config config.yaml] probe <分享链接>\n  clipbot [--config config.yaml] check\n  clipbot [--config config.yaml] login bilibili [--cookie-file 路径] [--qr-file 路径] [--timeout-seconds 180]\n\nparse 输出 JSON。probe 解析并流式下载校验，随后清理文件。默认命令为 bot。"
         );
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "--version") {
-        println!("allvideo {}", env!("CARGO_PKG_VERSION"));
+        println!("clipbot {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let config_path = if let Some(index) = args.iter().position(|arg| arg == "--config") {
@@ -144,7 +144,7 @@ async fn run() -> Result<()> {
 }
 
 async fn run_login(config: &AppConfig, args: &[String]) -> Result<()> {
-    use videorust::auth::bilibili::{LoginOptions, login};
+    use clipbot::auth::bilibili::{LoginOptions, login};
 
     if args.first().map(String::as_str) != Some("bilibili") {
         bail!("扫码登录当前支持 bilibili，使用 login bilibili 启动");

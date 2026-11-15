@@ -1,14 +1,14 @@
 [Unit]
-Description=AllVideo QQ media parser
+Description=ClipBot QQ media parser
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-User=allvideo
-Group=allvideo
-WorkingDirectory=/opt/allvideo
-ExecStart=/opt/allvideo/start.sh bot
+User=clipbot
+Group=clipbot
+WorkingDirectory=/opt/clipbot
+ExecStart=/opt/clipbot/start.sh bot
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=20
@@ -18,7 +18,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/allvideo/cookies /opt/allvideo/temp_videos /opt/allvideo/temp_jm
+ReadWritePaths=/opt/clipbot/cookies /opt/clipbot/temp_videos /opt/clipbot/temp_jm
 CPUQuota=50%
 MemoryMax=256M
 TasksMax=64

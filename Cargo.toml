@@ -1,6 +1,6 @@
 [package]
-name = "videorust"
-version = "0.2.9"
+name = "clipbot"
+version = "0.2.10"
 edition = "2024"
 description = "Rust 原站视频图集解析与 QQ 官方机器人"
 license = "MIT"

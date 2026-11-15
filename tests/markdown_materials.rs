@@ -6,12 +6,12 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, post, put};
 use axum::{Json, Router};
+use clipbot::bot::qqbot::{QQBotClient, QQBotError};
+use clipbot::types::QQBotConfig;
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
-use videorust::bot::qqbot::{QQBotClient, QQBotError};
-use videorust::types::QQBotConfig;
 
 const IMAGE: &[u8] = b"test image bytes with a stable digest";
 const COS_ETAG: &str = "0123456789abcdef0123456789abcdef";

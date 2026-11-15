@@ -1,10 +1,10 @@
-name: allvideo
+name: clipbot
 services:
-  allvideo:
+  clipbot:
     build:
       context: .
       target: media
-    image: allvideo:local
+    image: clipbot:local
     init: true
     restart: unless-stopped
     user: "65532:65532"

@@ -4,6 +4,7 @@
 /release/
 /docs/
 /AGENTS.md
+/scripts/package_release.py
 /.codex/
 /config.yaml
 /config.yml

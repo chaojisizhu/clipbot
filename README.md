@@ -1,10 +1,10 @@
-# AllVideo
+# ClipBot
 
 使用 Rust 编写的 QQ 官方机器人，可从分享链接解析视频、图片和实况图集，并将媒体回复到群聊或私聊。
 
 核心解析直接访问平台原站接口或分享页面。微信视频号通过元宝分享解析取得播放信息，再在本地下载、解密。抖音普通图集与实况图集支持基于已有登录态的原生 Web 请求签名。
 
-[下载发布包](https://github.com/chaojisizhu/allvideo/releases/latest) · [配置示例](config.example.yaml)
+[下载发布包](https://github.com/chaojisizhu/clipbot/releases/latest) · [配置示例](config.example.yaml)
 
 ## 功能
 
@@ -22,11 +22,11 @@ QQ 消息收发需要在 [QQ 开放平台](https://q.qq.com/) 创建机器人，
 
 ### Linux 发布包
 
-从 Releases 下载 `allvideo-v0.2.9-linux-x86_64.tar.gz`，解压后进入程序目录。发布包包含 `videorust`、裁剪版 FFmpeg 和 ffprobe，目标环境为 Ubuntu 22.04+ / Debian 12+ 的 x86_64 系统。运行环境需有 CA 证书、libgcc 和 OpenSSL 3。
+从 Releases 下载 `clipbot-v0.2.10-linux-x86_64.tar.gz`，解压后进入程序目录。发布包包含 `clipbot`、裁剪版 FFmpeg 和 ffprobe，目标环境为 Ubuntu 22.04+ / Debian 12+ 的 x86_64 系统。运行环境需有 CA 证书、libgcc 和 OpenSSL 3。
 
 ```bash
 cp config.example.yaml config.linux.yaml
-chmod +x videorust ffmpeg ffprobe start.sh
+chmod +x clipbot ffmpeg ffprobe start.sh
 ```
 
 编辑 `config.linux.yaml`，填写 `qqbot.appId`、`qqbot.appSecret`，再启动。
@@ -40,7 +40,7 @@ chmod +x videorust ffmpeg ffprobe start.sh
 
 ### Windows 发布包
 
-下载 `allvideo-v0.2.9-windows-x86_64.zip`，解压后在程序目录打开 PowerShell。
+下载 `clipbot-v0.2.10-windows-x86_64.zip`，解压后在程序目录打开 PowerShell。
 
 ```powershell
 Copy-Item config.example.yaml config.yaml
@@ -49,8 +49,8 @@ Copy-Item config.example.yaml config.yaml
 编辑 `config.yaml` 中的 QQ 凭据，再运行。
 
 ```powershell
-.\videorust.exe check
-.\videorust.exe bot
+.\clipbot.exe check
+.\clipbot.exe bot
 ```
 
 Windows 发布包中的主程序可独立启动。HLS/DASH 合流和实况视频合并需要另行安装 FFmpeg、ffprobe，并将它们加入 `PATH`。也可通过 `output.ffmpegCommand` 指定 FFmpeg 路径，程序会优先查找同目录的 ffprobe。
@@ -68,7 +68,7 @@ mkdir -p cookies
 
 ```bash
 docker compose build
-docker compose run --rm allvideo check
+docker compose run --rm clipbot check
 docker compose up -d
 docker compose logs --tail 100 -f
 ```
@@ -101,7 +101,7 @@ Compose 默认构建 `media` 镜像，以非 root 用户运行，配置及 Cooki
 | `output.ffmpegCommand` | FFmpeg 命令或可执行文件路径 |
 | `resources.maxTempBytes` | 活跃临时媒体的磁盘预算 |
 
-QQ 与元宝凭据也可通过 `QQBOT_APP_ID`、`QQBOT_APP_SECRET`、`YUANBAO_COOKIE` 环境变量传入。代理可通过 `ALLVIDEO_PROXY` 设置。
+QQ 与元宝凭据也可通过 `QQBOT_APP_ID`、`QQBOT_APP_SECRET`、`YUANBAO_COOKIE` 环境变量传入。代理可通过 `CLIPBOT_PROXY` 设置，兼容旧的 `ALLVIDEO_PROXY`。
 
 ### B站扫码登录
 
@@ -109,7 +109,7 @@ QQ 与元宝凭据也可通过 `QQBOT_APP_ID`、`QQBOT_APP_SECRET`、`YUANBAO_CO
 ./start.sh login bilibili
 ```
 
-Windows 对应命令为 `videorust.exe login bilibili`。用 B站 App 扫描生成的 `cookies/bilibili-login.png` 并确认，成功后保存 `cookies/bilibili.txt`，后续启动自动加载。
+Windows 对应命令为 `clipbot.exe login bilibili`。用 B站 App 扫描生成的 `cookies/bilibili-login.png` 并确认，成功后保存 `cookies/bilibili.txt`，后续启动自动加载。
 
 可用 `--cookie-file`、`--qr-file` 和 `--timeout-seconds` 指定输出位置与等待时间。Cookie 保存后会检查原站登录状态，访问验证及权限要求仍由原站决定。
 
@@ -144,10 +144,10 @@ B站普通视频、抖音视频与图集、小红书视频、X 视频与图集�
 ## 命令行工具
 
 ```bash
-videorust --config config.yaml check
-videorust --config config.yaml parse '<分享链接>'
-videorust --config config.yaml probe '<分享链接>'
-videorust --help
+clipbot --config config.yaml check
+clipbot --config config.yaml parse '<分享链接>'
+clipbot --config config.yaml probe '<分享链接>'
+clipbot --help
 ```
 
 `check` 检查配置加载情况。`parse` 输出逐行 JSON。`probe` 完整下载普通视频，或下载并合并抖音实况短片，验证后清理临时媒体；普通静态图集输出解析到的图片数量。
@@ -172,14 +172,14 @@ HTTP 401、403、412 触发平台冷却，429 遵从 `Retry-After`。同一抖�
 需要支持 Rust 2024 edition 的 Rust 工具链。媒体合流及实况功能需要 FFmpeg 和 ffprobe。
 
 ```bash
-git clone https://github.com/chaojisizhu/allvideo.git
-cd allvideo
+git clone https://github.com/chaojisizhu/clipbot.git
+cd clipbot
 cargo build --release --locked
 cp config.example.yaml config.yaml
-./target/release/videorust check
+./target/release/clipbot check
 ```
 
-Windows 使用 `target\release\videorust.exe`。可选的 Python 功能需另行安装对应依赖，并在配置中启用。
+Windows 使用 `target\release\clipbot.exe`。可选的 Python 功能需另行安装对应依赖，并在配置中启用。
 
 ```bash
 cargo fmt --all -- --check

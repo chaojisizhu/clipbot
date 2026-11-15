@@ -5,10 +5,10 @@ COPY src ./src
 COPY tests ./tests
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked && cp target/release/videorust /usr/local/bin/videorust
+    cargo build --release --locked && cp target/release/clipbot /usr/local/bin/clipbot
 RUN mkdir -p /runtime-root/usr/local/bin /runtime-root/etc/ssl/certs /runtime-root/app/temp_videos /runtime-root/app/temp_jm \
-    && cp /usr/local/bin/videorust /runtime-root/usr/local/bin/ \
-    && ldd /usr/local/bin/videorust | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' \
+    && cp /usr/local/bin/clipbot /runtime-root/usr/local/bin/ \
+    && ldd /usr/local/bin/clipbot | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' \
        | xargs -I '{}' cp --parents '{}' /runtime-root \
     && cp /etc/ssl/certs/ca-certificates.crt /runtime-root/etc/ssl/certs/ \
     && printf 'hosts: files dns\n' > /runtime-root/etc/nsswitch.conf \
@@ -52,7 +52,7 @@ COPY --chown=65532:65532 config.example.yaml ./config.example.yaml
 ENV RUST_LOG=info
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/videorust"]
+ENTRYPOINT ["/usr/local/bin/clipbot"]
 CMD ["bot"]
 
 FROM runtime AS media
@@ -72,7 +72,7 @@ RUN mkdir -p /app/temp_videos /app/temp_jm && chown -R 65532:65532 /app
 ENV PATH="/opt/extras/bin:${PATH}"
 COPY scripts ./scripts
 USER 65532:65532
-ENTRYPOINT ["/usr/local/bin/videorust"]
+ENTRYPOINT ["/usr/local/bin/clipbot"]
 CMD ["bot"]
 
 FROM media AS default

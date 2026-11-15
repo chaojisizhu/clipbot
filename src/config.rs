@@ -86,6 +86,11 @@ fn apply_environment(config: &mut AppConfig) {
             *target = value;
         }
     }
+    if let Ok(value) = std::env::var("CLIPBOT_PROXY")
+        && !value.trim().is_empty()
+    {
+        config.api.proxy = value;
+    }
     if config.gpt_detect.api_key.is_empty() {
         config.gpt_detect.api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     }

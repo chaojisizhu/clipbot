@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_OWNED_MATERIALS: usize = 100;
 pub const DEFAULT_DELETE_DELAY_SECS: u64 = 300;
+// Preserve the on-disk ledger name so upgrades retain ownership of existing materials.
 const LEDGER_NAME: &str = ".allvideo-markdown-materials.json";
 const MAX_LEDGER_BYTES: u64 = 256 * 1024;
 const MAX_ID_BYTES: usize = 1024;
@@ -248,7 +249,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         Err(error) => return Err(error).context("检查 Markdown 素材记录失败"),
     }
     let temporary = parent.join(format!(
-        ".allvideo-markdown-materials-{:032x}.tmp",
+        ".clipbot-markdown-materials-{:032x}.tmp",
         rand::random::<u128>()
     ));
     let _pending = PendingFile(temporary.clone());

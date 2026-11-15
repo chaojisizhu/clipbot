@@ -4,9 +4,9 @@ use std::time::Duration;
 use axum::extract::{Path as RoutePath, State};
 use axum::http::{StatusCode, header};
 use axum::routing::get;
-use videorust::parser::process::spawn_capture;
-use videorust::parser::remux::download_live_album_temp;
-use videorust::types::{AppConfig, LivePhoto, ParsedData};
+use clipbot::parser::process::spawn_capture;
+use clipbot::parser::remux::download_live_album_temp;
+use clipbot::types::{AppConfig, LivePhoto, ParsedData};
 
 async fn create_clip(path: &Path, color: &str, dimensions: &str) {
     spawn_capture(

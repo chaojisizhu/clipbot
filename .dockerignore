@@ -3,6 +3,7 @@ target
 dist
 docs
 AGENTS.md
+scripts/package_release.py
 release
 releases
 config.yaml

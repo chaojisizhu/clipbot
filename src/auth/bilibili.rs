@@ -176,8 +176,7 @@ impl LoginCookies {
     }
 
     fn netscape(&self) -> Result<String> {
-        let mut output =
-            String::from("# Netscape HTTP Cookie File\n# AllVideo Bilibili QR login\n");
+        let mut output = String::from("# Netscape HTTP Cookie File\n# ClipBot Bilibili QR login\n");
         let now = unix_seconds();
         for cookie in self
             .0
@@ -616,7 +615,7 @@ fn atomic_write(target: &Path, bytes: &[u8]) -> Result<()> {
         builder.create(parent).context("创建登录文件目录失败")?;
     }
     let temporary = parent.join(format!(
-        ".allvideo-login-{:032x}.tmp",
+        ".clipbot-login-{:032x}.tmp",
         rand::random::<u128>()
     ));
     let pending = PendingFile(temporary.clone());

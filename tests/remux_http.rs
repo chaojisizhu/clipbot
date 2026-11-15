@@ -4,10 +4,10 @@ use std::time::Duration;
 use axum::extract::{Path as RoutePath, State};
 use axum::http::{StatusCode, header};
 use axum::routing::get;
+use clipbot::parser::process::spawn_capture;
+use clipbot::parser::remux::download_parsed_temp;
+use clipbot::types::{AppConfig, ParsedData};
 use serde_json::Value;
-use videorust::parser::process::spawn_capture;
-use videorust::parser::remux::download_parsed_temp;
-use videorust::types::{AppConfig, ParsedData};
 
 async fn ffmpeg(args: Vec<String>) {
     spawn_capture("ffmpeg", &args, Duration::from_secs(30))
@@ -136,7 +136,7 @@ async fn remuxes_http_dash_and_hls_with_audio_and_cleans_outputs() {
     let file = download_parsed_temp(&hls, &config).await.unwrap();
     assert_eq!(streams(file.path()).await, ["video", "audio"]);
     drop(file);
-    config.output.ffmpeg_command = "allvideo-test-missing-ffmpeg".into();
+    config.output.ffmpeg_command = "clipbot-test-missing-ffmpeg".into();
     assert!(download_parsed_temp(&hls, &config).await.is_err());
     assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
     server.abort();

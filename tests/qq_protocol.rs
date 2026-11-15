@@ -8,17 +8,17 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use clipbot::bot::message::{media_payload, text_payload};
+use clipbot::bot::qqbot::{INTENT_GROUP_AND_C2C, QQBotClient};
+use clipbot::parser::api::VideoParserService;
+use clipbot::service::AppState;
+use clipbot::types::{AppConfig, BotEvent, QQBotConfig};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
 use tokio::sync::{Barrier, Mutex, mpsc};
 use tokio::time::timeout;
-use videorust::bot::message::{media_payload, text_payload};
-use videorust::bot::qqbot::{INTENT_GROUP_AND_C2C, QQBotClient};
-use videorust::parser::api::VideoParserService;
-use videorust::service::AppState;
-use videorust::types::{AppConfig, BotEvent, QQBotConfig};
 
 const PARALLEL_BLOCK_SIZE: usize = 64 * 1024 + 4;
 

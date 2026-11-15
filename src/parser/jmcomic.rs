@@ -277,7 +277,7 @@ async fn create_selected_7z_archive(
 ) -> anyhow::Result<()> {
     let seven_zip =
         seven_zip_command().ok_or_else(|| anyhow::anyhow!("找不到 7zr/7zz/7z 压缩工具"))?;
-    let list_path = work_dir.join(".allvideo-files.txt");
+    let list_path = work_dir.join(".clipbot-files.txt");
     std::fs::write(&list_path, selected_file_list(work_dir, images)?)?;
     let args = vec![
         "a".into(),

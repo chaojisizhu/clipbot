@@ -39,7 +39,7 @@ impl TempMedia {
             bail!("临时媒体大小上限必须大于零");
         }
         std::fs::create_dir_all(directory)?;
-        let path = directory.join(format!("allvideo-{:032x}.mp4", rand::random::<u128>()));
+        let path = directory.join(format!("clipbot-{:032x}.mp4", rand::random::<u128>()));
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -334,7 +334,7 @@ pub async fn download_media_temp(
             {
                 bail!("视频超过大小上限 {} MiB", max_bytes / 1024 / 1024);
             }
-            let path = directory.join(format!("allvideo-{:032x}.mp4", rand::random::<u128>()));
+            let path = directory.join(format!("clipbot-{:032x}.mp4", rand::random::<u128>()));
             // Claim the pathname synchronously so a cancelled open cannot leave
             // a file created by an unfinished Tokio filesystem worker.
             let opened = std::fs::OpenOptions::new()
