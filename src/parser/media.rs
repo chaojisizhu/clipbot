@@ -8,12 +8,13 @@ use futures_util::StreamExt;
 use once_cell::sync::Lazy;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Proxy};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufWriter};
 use url::Url;
 
 use crate::parser::channels::decrypt_channels_video;
 
 const BUFFER_LIMIT: u64 = 50 * 1024 * 1024;
+const DOWNLOAD_WRITE_BUFFER: usize = 64 * 1024;
 const ENCRYPTED_PREFIX: usize = 128 * 1024;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 static TEMP_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -169,6 +170,13 @@ fn check_url(raw: &str) -> Result<()> {
     Ok(())
 }
 
+fn can_try_next_media_client(error: &anyhow::Error) -> bool {
+    !error
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        .is_some_and(|status| matches!(status.as_u16(), 401 | 403 | 412 | 429))
+}
+
 fn check_video_response(response: &reqwest::Response) -> Result<()> {
     let path = response.url().path().to_ascii_lowercase();
     let content_type = response
@@ -242,8 +250,9 @@ pub async fn download_media_buffer_with_headers(
                 .get(url)
                 .headers(headers.clone())
                 .send()
-                .await?
-                .error_for_status()?;
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(reqwest::Error::without_url)?;
             if response
                 .content_length()
                 .is_some_and(|length| length > limit)
@@ -253,7 +262,7 @@ pub async fn download_media_buffer_with_headers(
             let mut data = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(reqwest::Error::without_url)?;
                 if data.len() as u64 + chunk.len() as u64 > limit {
                     bail!("媒体超过内存中转上限 {} MiB", limit / 1024 / 1024);
                 }
@@ -267,7 +276,8 @@ pub async fn download_media_buffer_with_headers(
         .await;
         match attempt {
             Ok(data) => return Ok(data),
-            Err(error) => last_error = error.to_string(),
+            Err(error) if can_try_next_media_client(&error) => last_error = error.to_string(),
+            Err(error) => bail!("媒体下载失败: {error}"),
         }
     }
     bail!("媒体下载失败 {last_error}")
@@ -314,8 +324,9 @@ pub async fn download_media_temp(
                 .headers(headers.clone())
                 .timeout(timeout)
                 .send()
-                .await?
-                .error_for_status()?;
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(reqwest::Error::without_url)?;
             check_video_response(&response)?;
             if response
                 .content_length()
@@ -337,10 +348,11 @@ pub async fn download_media_temp(
                 reserved: 0,
             };
             // The file is dropped before its guard on cancellation, including on Windows.
-            let mut file = tokio::fs::File::from_std(opened);
+            let mut writer =
+                BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, tokio::fs::File::from_std(opened));
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
+                let chunk = chunk.map_err(reqwest::Error::without_url)?;
                 let next_size = temporary.size.saturating_add(chunk.len() as u64);
                 if next_size > max_bytes {
                     bail!("视频超过大小上限 {} MiB", max_bytes / 1024 / 1024);
@@ -348,11 +360,13 @@ pub async fn download_media_temp(
                 reserve_temp(chunk.len() as u64, max_temp_bytes)?;
                 temporary.size = next_size;
                 temporary.reserved += chunk.len() as u64;
-                file.write_all(&chunk).await?;
+                writer.write_all(&chunk).await?;
             }
             if temporary.size == 0 {
                 bail!("下载内容为空");
             }
+            writer.flush().await?;
+            let mut file = writer.into_inner();
             if let Some(key) = decode_key {
                 let key: u64 = key.parse().context("无效的视频号解密密钥")?;
                 file.seek(std::io::SeekFrom::Start(0)).await?;
@@ -373,7 +387,8 @@ pub async fn download_media_temp(
         .await;
         match attempt {
             Ok(temporary) => return Ok(temporary),
-            Err(error) => last_error = error.to_string(),
+            Err(error) if can_try_next_media_client(&error) => last_error = error.to_string(),
+            Err(error) => bail!("媒体下载失败: {error}"),
         }
     }
     bail!("媒体下载失败 {last_error}")
@@ -512,6 +527,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_limited_media_does_not_try_a_second_route() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/video", listener.local_addr().unwrap());
+        let denied = axum::Router::new().fallback(|| async {
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                [(reqwest::header::RETRY_AFTER, "60")],
+            )
+        });
+        let origin = tokio::spawn(async move { axum::serve(listener, denied).await.unwrap() });
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxies = [format!("http://{}", proxy.local_addr().unwrap())];
+        let directory = tempfile::tempdir().unwrap();
+
+        let error = download_media_temp(
+            &url,
+            &proxies,
+            &HashMap::new(),
+            directory.path(),
+            16384,
+            65536,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("429"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), proxy.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        origin.abort();
+    }
+
+    #[tokio::test]
     async fn cancellation_removes_partial_download() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/slow", listener.local_addr().unwrap());
@@ -544,15 +596,12 @@ mod tests {
         });
         let started = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let written = std::fs::read_dir(directory.path())
+                // A partial chunk can still be buffered when the transfer is cancelled.
+                let opened = std::fs::read_dir(directory.path())
                     .unwrap()
                     .filter_map(Result::ok)
-                    .any(|entry| {
-                        std::fs::File::open(entry.path())
-                            .and_then(|file| file.metadata())
-                            .is_ok_and(|metadata| metadata.len() > 0)
-                    });
-                if written {
+                    .any(|entry| entry.path().is_file());
+                if opened {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

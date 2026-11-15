@@ -1,24 +1,26 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Barrier, Mutex, mpsc};
 use tokio::time::timeout;
 use videorust::bot::message::{media_payload, text_payload};
 use videorust::bot::qqbot::{INTENT_GROUP_AND_C2C, QQBotClient};
 use videorust::parser::api::VideoParserService;
 use videorust::service::AppState;
 use videorust::types::{AppConfig, BotEvent, QQBotConfig};
+
+const PARALLEL_BLOCK_SIZE: usize = 64 * 1024 + 4;
 
 #[derive(Clone, Debug)]
 struct RequestLog {
@@ -35,8 +37,15 @@ struct MockState {
     ws_tx: Arc<Mutex<Option<mpsc::Sender<Value>>>>,
     passive_limit: Arc<AtomicBool>,
     cos_parts: Arc<Mutex<Vec<Vec<u8>>>>,
+    parallel_puts: Option<Arc<ParallelPuts>>,
     http_base: String,
     ws_url: String,
+}
+
+struct ParallelPuts {
+    barrier: Barrier,
+    active: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 async fn record(state: &MockState, path: String, method: &str, headers: &HeaderMap, body: Value) {
@@ -191,11 +200,16 @@ async fn upload_prepare(
             })
         })
         .collect::<Vec<_>>();
-    Json(json!({
+    let mut response = json!({
         "upload_id": "upload-test-1",
         "block_size": 4,
         "parts": parts
-    }))
+    });
+    if state.parallel_puts.is_some() {
+        response["concurrency"] = json!(2);
+        response["block_size"] = json!(PARALLEL_BLOCK_SIZE);
+    }
+    Json(response)
 }
 
 async fn upload_part_finish(
@@ -217,12 +231,33 @@ async fn upload_part_finish(
 
 async fn cos_part(
     State(state): State<MockState>,
-    Path(_part): Path<String>,
+    Path(part): Path<usize>,
+    headers: HeaderMap,
     body: Bytes,
-) -> &'static str {
+) -> Result<&'static str, StatusCode> {
     assert!(!body.is_empty());
+    if let Some(puts) = &state.parallel_puts {
+        let active = puts.active.fetch_add(1, Ordering::SeqCst) + 1;
+        puts.peak.fetch_max(active, Ordering::SeqCst);
+        let reached = timeout(Duration::from_secs(2), puts.barrier.wait()).await;
+        // Keep both requests in flight so additional PUTs would raise the peak.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        puts.active.fetch_sub(1, Ordering::SeqCst);
+        reached.map_err(|_| StatusCode::GATEWAY_TIMEOUT)?;
+        record(
+            &state,
+            format!("/cos/{part}"),
+            "PUT",
+            &headers,
+            json!({
+                "bytes": body.len(),
+                "md5": format!("{:x}", md5::compute(&body)),
+            }),
+        )
+        .await;
+    }
     state.cos_parts.lock().await.push(body.to_vec());
-    "{}"
+    Ok("{}")
 }
 
 async fn push_event(state: &MockState, value: Value) {
@@ -250,6 +285,12 @@ async fn wait_for_identify(state: &MockState) {
 }
 
 async fn start_mock() -> (MockState, tokio::task::JoinHandle<()>) {
+    start_mock_with_parallel_puts(false).await
+}
+
+async fn start_mock_with_parallel_puts(
+    parallel_puts: bool,
+) -> (MockState, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = MockState {
@@ -258,6 +299,13 @@ async fn start_mock() -> (MockState, tokio::task::JoinHandle<()>) {
         ws_tx: Arc::new(Mutex::new(None)),
         passive_limit: Arc::new(AtomicBool::new(false)),
         cos_parts: Arc::new(Mutex::new(Vec::new())),
+        parallel_puts: parallel_puts.then(|| {
+            Arc::new(ParallelPuts {
+                barrier: Barrier::new(2),
+                active: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            })
+        }),
         http_base: format!("http://{address}"),
         ws_url: format!("ws://{address}/ws"),
     };
@@ -482,6 +530,75 @@ async fn gateway_reply_and_chunked_upload_protocol() {
 
     bot.stop();
     let _ = timeout(Duration::from_secs(2), bot_task).await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn file_upload_overlaps_two_puts_and_finishes_before_assembly() {
+    let (state, server) = start_mock_with_parallel_puts(true).await;
+    let bot = QQBotClient::new(QQBotConfig {
+        app_id: "test-app-id".into(),
+        app_secret: "test-secret".into(),
+        api_base: state.http_base.clone(),
+        ..QQBotConfig::default()
+    });
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("parallel.mp4");
+    // Cross the streaming reader's 64 KiB boundary within each full part.
+    let data: Vec<u8> = (0..3 * PARALLEL_BLOCK_SIZE + 19)
+        .map(|offset| (offset % 251) as u8)
+        .collect();
+    tokio::fs::write(&path, &data).await.unwrap();
+
+    let uploaded = timeout(
+        Duration::from_secs(5),
+        bot.upload_group_media_file("GROUP001", 2, "parallel.mp4", &path),
+    )
+    .await
+    .expect("upload timed out")
+    .expect("the server waits for two simultaneous PUTs");
+    assert_eq!(uploaded["file_info"], "FILE_INFO_UPLOADED");
+    assert_eq!(
+        state
+            .parallel_puts
+            .as_ref()
+            .unwrap()
+            .peak
+            .load(Ordering::SeqCst),
+        2
+    );
+
+    let calls = state.calls.lock().await;
+    let complete = calls.last().unwrap();
+    assert!(complete.path.ends_with("/files"));
+    assert_eq!(complete.body, json!({"upload_id":"upload-test-1"}));
+    assert_eq!(calls.iter().filter(|call| call.method == "PUT").count(), 4);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.path.ends_with("/upload_part_finish"))
+            .count(),
+        4
+    );
+    for (offset, bytes) in data.chunks(PARALLEL_BLOCK_SIZE).enumerate() {
+        let index = offset + 1;
+        let expected_md5 = format!("{:x}", md5::compute(bytes));
+        let put_path = format!("/cos/{index}");
+        let put = calls.iter().position(|call| call.path == put_path).unwrap();
+        let finish = calls
+            .iter()
+            .position(|call| {
+                call.path.ends_with("/upload_part_finish") && call.body["part_index"] == index
+            })
+            .unwrap();
+        assert!(put < finish);
+        assert_eq!(calls[put].body["bytes"], bytes.len());
+        assert_eq!(calls[put].body["md5"], expected_md5);
+        assert!(calls[put].authorization.is_none());
+        assert_eq!(calls[finish].body["block_size"], bytes.len());
+        assert_eq!(calls[finish].body["md5"], expected_md5);
+        assert_eq!(calls[finish].body["upload_id"], "upload-test-1");
+    }
     server.abort();
 }
 

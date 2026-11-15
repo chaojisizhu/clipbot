@@ -11,9 +11,10 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use url::Url;
 
 use crate::parser::channels::parse_channels_share;
-use crate::parser::http::{SiteHttp, validate_site_url};
+use crate::parser::http::{SiteAccessRestricted, SiteHttp, SiteJsonUnavailable, validate_site_url};
 use crate::parser::jmcomic::download_jm_album;
 use crate::parser::matcher::clean_url;
+use crate::parser::sites_page::DouyinMediaUnavailable;
 use crate::parser::{sites_core, sites_extra, sites_other, sites_page, twitter};
 use crate::types::{AppConfig, ParsedData};
 
@@ -42,10 +43,17 @@ impl ParseResult {
 }
 
 struct CacheEntry {
-    data: ParsedData,
+    value: CacheValue,
     expires: Instant,
     last_used: Instant,
     weight: usize,
+}
+
+#[derive(Clone)]
+enum CacheValue {
+    Media(Box<ParsedData>),
+    DouyinRedirect(String),
+    DouyinUnavailable,
 }
 
 pub struct VideoParserService {
@@ -75,22 +83,34 @@ impl VideoParserService {
         &self.config
     }
 
-    fn cached(&self, key: &str) -> Option<ParsedData> {
+    fn cached(&self, key: &str) -> Option<CacheValue> {
         let mut cache = self.cache.lock().ok()?;
         let now = Instant::now();
         cache.retain(|_, entry| entry.expires > now);
         let entry = cache.get_mut(key)?;
         entry.last_used = now;
-        Some(entry.data.clone())
+        Some(entry.value.clone())
     }
 
     fn cache_result(&self, key: String, data: &ParsedData) {
-        if self.config.resources.cache_entries == 0 || data.attachment.is_some() {
+        if data.attachment.is_none() {
+            self.cache_value(key, CacheValue::Media(Box::new(data.clone())), 300);
+        }
+    }
+
+    fn cache_value(&self, key: String, value: CacheValue, max_ttl_seconds: u64) {
+        let ttl_seconds = self.config.resources.cache_ttl_seconds.min(max_ttl_seconds);
+        if self.config.resources.cache_entries == 0 || ttl_seconds == 0 {
             return;
         }
-        let weight = serde_json::to_vec(data)
-            .map(|bytes| bytes.len())
-            .unwrap_or(usize::MAX);
+        let value_weight = match &value {
+            CacheValue::Media(data) => serde_json::to_vec(data)
+                .map(|bytes| bytes.len())
+                .unwrap_or(usize::MAX),
+            CacheValue::DouyinRedirect(url) => url.len(),
+            CacheValue::DouyinUnavailable => 0,
+        };
+        let weight = value_weight.saturating_add(key.len());
         let budget = self.config.resources.max_cache_bytes.min(64 * 1024 * 1024);
         if weight > budget {
             return;
@@ -115,14 +135,27 @@ impl VideoParserService {
             cache.insert(
                 key,
                 CacheEntry {
-                    data: data.clone(),
-                    expires: now
-                        + Duration::from_secs(self.config.resources.cache_ttl_seconds.min(300)),
+                    value,
+                    expires: now + Duration::from_secs(ttl_seconds),
                     last_used: now,
                     weight,
                 },
             );
         }
+    }
+
+    fn cached_result(&self, key: &str) -> Option<Result<ParsedData>> {
+        match self.cached(key)? {
+            CacheValue::Media(data) => Some(Ok(*data)),
+            CacheValue::DouyinUnavailable => Some(Err(DouyinMediaUnavailable.into())),
+            CacheValue::DouyinRedirect(_) => None,
+        }
+    }
+
+    fn key_lock(&self, key: &str) -> &AsyncMutex<()> {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.key_locks[hasher.finish() as usize % self.key_locks.len()]
     }
 
     pub async fn parse_url(&self, url: &str, platform: &str) -> ParseResult {
@@ -142,17 +175,6 @@ impl VideoParserService {
         if platform != "jmcomic" {
             validate_site_url(url, platform)?;
         }
-        let key = format!("{platform}:{}", clean_url(url));
-        if let Some(data) = self.cached(&key) {
-            return Ok(data);
-        }
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
-        let _key_guard = self.key_locks[hasher.finish() as usize % 64].lock().await;
-        if let Some(data) = self.cached(&key) {
-            return Ok(data);
-        }
-        let _permit = self.semaphore.acquire().await?;
         let timeout_ms = if platform == "jmcomic" {
             self.config.jmcomic.timeout.clamp(1000, 600_000)
         } else {
@@ -164,12 +186,50 @@ impl VideoParserService {
                 })
             .clamp(1000, 300_000)
         };
-        let mut data = tokio::time::timeout(
-            Duration::from_millis(timeout_ms),
-            self.parse_uncached(url, platform),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("{platform} 解析超时"))??;
+        let timeout = Duration::from_millis(timeout_ms);
+        if platform == "douyin" && is_short_link(url) {
+            return tokio::time::timeout(timeout, async {
+                let resolved = self.resolve_douyin_short(url).await?;
+                self.parse_resolved(&resolved, platform, None).await
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("{platform} 解析超时"))?;
+        }
+        self.parse_resolved(url, platform, Some(timeout)).await
+    }
+
+    async fn parse_resolved(
+        &self,
+        url: &str,
+        platform: &str,
+        timeout: Option<Duration>,
+    ) -> Result<ParsedData> {
+        let key = parse_cache_key(url, platform);
+        if let Some(result) = self.cached_result(&key) {
+            return result;
+        }
+        let _key_guard = self.key_lock(&key).lock().await;
+        if let Some(result) = self.cached_result(&key) {
+            return result;
+        }
+        let _permit = self.semaphore.acquire().await?;
+        let request = self.parse_uncached(url, platform);
+        let result = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, request)
+                .await
+                .map_err(|_| anyhow::anyhow!("{platform} 解析超时"))?
+        } else {
+            request.await
+        };
+        let mut data = match result {
+            Ok(data) => data,
+            Err(error) => {
+                if error.is::<DouyinMediaUnavailable>() {
+                    self.cache_value(key, CacheValue::DouyinUnavailable, 30);
+                }
+                return Err(error);
+            }
+        };
         if !data.has_media() && data.attachment.is_none() {
             bail!("{platform} 未找到可用媒体，请补充登录 Cookie 或检查链接访问权限");
         }
@@ -188,6 +248,21 @@ impl VideoParserService {
         }
         self.cache_result(key, &data);
         Ok(data)
+    }
+
+    async fn resolve_douyin_short(&self, url: &str) -> Result<String> {
+        let key = format!("douyin-short:{}", clean_url(url));
+        if let Some(CacheValue::DouyinRedirect(resolved)) = self.cached(&key) {
+            return Ok(resolved);
+        }
+        let _short_guard = self.key_lock(&key).lock().await;
+        if let Some(CacheValue::DouyinRedirect(resolved)) = self.cached(&key) {
+            return Ok(resolved);
+        }
+        let _permit = self.semaphore.acquire().await?;
+        let resolved = self.http.resolve_douyin_short(url).await?;
+        self.cache_value(key, CacheValue::DouyinRedirect(resolved.clone()), 300);
+        Ok(resolved)
     }
 
     async fn parse_uncached(&self, url: &str, platform: &str) -> Result<ParsedData> {
@@ -216,7 +291,7 @@ impl VideoParserService {
                 .parse_twitter_authenticated(&clean_url(url), cookie_file)
                 .await;
         }
-        let resolved = if is_short_link(url) {
+        let resolved = if platform != "douyin" && is_short_link(url) {
             self.http.resolve_url(url, platform).await?
         } else {
             url.to_string()
@@ -235,7 +310,22 @@ impl VideoParserService {
             "twitter" => twitter::parse_native(&self.http, &resolved).await,
             _ => sites_page::parse(&self.http, &resolved, platform).await,
         };
+        self.complete_native(native, &resolved, platform).await
+    }
+
+    async fn complete_native(
+        &self,
+        native: Result<ParsedData>,
+        resolved: &str,
+        platform: &str,
+    ) -> Result<ParsedData> {
         if let Err(error) = &native {
+            if error.is::<SiteAccessRestricted>()
+                || error.is::<DouyinMediaUnavailable>()
+                || platform == "douyin" && error.is::<SiteJsonUnavailable>()
+            {
+                return native;
+            }
             let message = error.to_string();
             if [
                 "访问验证",
@@ -263,7 +353,7 @@ impl VideoParserService {
                     .map(|error| error.to_string())
                     .unwrap_or_else(|| "原生解析未返回媒体".into());
                 twitter::parse_ytdlp(
-                    &resolved,
+                    resolved,
                     &self.config.ytdlp,
                     self.config
                         .auth
@@ -359,6 +449,7 @@ fn is_short_link(raw: &str) -> bool {
                 | "bili2233.cn"
                 | "hy.fan"
                 | "v.douyin.com"
+                | "www.v.douyin.com"
                 | "v.kuaishou.com"
                 | "xhslink.com"
                 | "t.co"
@@ -370,9 +461,72 @@ fn is_short_link(raw: &str) -> bool {
     )
 }
 
+fn parse_cache_key(url: &str, platform: &str) -> String {
+    if platform == "douyin"
+        && let Some(id) = sites_page::douyin_id(url)
+    {
+        return format!("douyin:work:{id}");
+    }
+    format!("{platform}:{}", clean_url(url))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_unavailable_douyin_item_does_not_activate_platform_cooldown_or_fallback() {
+        let mut config = AppConfig::default();
+        config.ytdlp.enabled = true;
+        let service = VideoParserService::new(config).unwrap();
+        let url = "https://www.iesdouyin.com/share/video/123/";
+        let unavailable = sites_page::parse_page("<html></html>", url, "douyin");
+
+        let error = service
+            .complete_native(unavailable, url, "douyin")
+            .await
+            .unwrap_err();
+        assert!(error.is::<DouyinMediaUnavailable>());
+        assert!(!service.http.is_cooling_down("douyin").await);
+    }
+
+    #[tokio::test]
+    async fn douyin_long_and_resolved_short_links_share_the_cached_item_result() {
+        let mut config = AppConfig::default();
+        config.resources.cache_ttl_seconds = 120;
+        let service = VideoParserService::new(config).unwrap();
+        let short = "https://v.douyin.com/example";
+        let share = "https://www.iesdouyin.com/share/video/123?utm_source=share";
+        let long = "https://www.douyin.com/video/123";
+        let key = parse_cache_key(share, "douyin");
+        assert_eq!(key, parse_cache_key(long, "douyin"));
+        service.cache_value(
+            format!("douyin-short:{short}"),
+            CacheValue::DouyinRedirect(share.into()),
+            300,
+        );
+        service.cache_value(key.clone(), CacheValue::DouyinUnavailable, 30);
+        let expiry = service.cache.lock().unwrap().get(&key).unwrap().expires;
+        assert!(expiry.saturating_duration_since(Instant::now()) <= Duration::from_secs(30));
+
+        service.http.cool_down("douyin").await;
+        for url in [short, share, long] {
+            assert!(
+                service
+                    .parse(url, "douyin")
+                    .await
+                    .unwrap_err()
+                    .is::<DouyinMediaUnavailable>()
+            );
+        }
+        assert!(
+            service
+                .parse("https://www.douyin.com/video/456", "douyin")
+                .await
+                .unwrap_err()
+                .is::<SiteAccessRestricted>()
+        );
+    }
 
     #[test]
     fn authenticated_twitter_selects_platform_cookie_file_and_honors_disable() {

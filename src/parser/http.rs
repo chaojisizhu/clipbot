@@ -13,6 +13,50 @@ use url::Url;
 
 use crate::types::AppConfig;
 
+#[derive(Debug)]
+pub(super) struct SiteAccessRestricted(String);
+
+impl std::fmt::Display for SiteAccessRestricted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SiteAccessRestricted {}
+
+#[derive(Debug)]
+pub(super) struct SiteJsonUnavailable(String);
+
+impl std::fmt::Display for SiteJsonUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SiteJsonUnavailable {}
+
+#[derive(Default)]
+struct RequestOptions<'a> {
+    headers: HeaderMap,
+    json: Option<&'a Value>,
+    form: Option<&'a [(String, String)]>,
+    stop_at: Option<fn(&Url) -> bool>,
+}
+
+enum SiteResponse {
+    Final(Response),
+    RedirectTarget(Url),
+}
+
+impl SiteResponse {
+    fn into_final(self) -> Result<Response> {
+        match self {
+            Self::Final(response) => Ok(response),
+            Self::RedirectTarget(_) => bail!("平台请求未到达最终响应"),
+        }
+    }
+}
+
 pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 pub const MOBILE_USER_AGENT: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 Version/17.5 Mobile/15E148 Safari/604.1";
 
@@ -268,34 +312,34 @@ impl SiteHttp {
         method: Method,
         raw: &str,
         platform: &str,
-        headers: HeaderMap,
-        body: Option<&Value>,
-        form: Option<&[(String, String)]>,
-    ) -> Result<Response> {
+        options: RequestOptions<'_>,
+    ) -> Result<SiteResponse> {
         let mut url = validate_site_url(raw, platform)?;
         let mut state = self.gates.get(platform).context("未知平台")?.lock().await;
-        if state.blocked_until > Instant::now() {
-            bail!(
+        let now = Instant::now();
+        if state.blocked_until > now {
+            return Err(SiteAccessRestricted(format!(
                 "{platform} 处于访问限制冷却期，请在 {} 秒后重试",
                 state
                     .blocked_until
-                    .duration_since(Instant::now())
+                    .duration_since(now)
                     .as_secs()
                     .saturating_add(1)
-            );
+            ))
+            .into());
         }
         let mut request_method = method;
         for _ in 0..=8 {
             let send = |client: &Client| {
                 let mut request = client
                     .request(request_method.clone(), url.clone())
-                    .headers(headers.clone());
-                if !headers.contains_key(reqwest::header::USER_AGENT)
+                    .headers(options.headers.clone());
+                if !options.headers.contains_key(reqwest::header::USER_AGENT)
                     && matches!(platform, "douyin" | "kuaishou")
                 {
                     request = request.header(reqwest::header::USER_AGENT, MOBILE_USER_AGENT);
                 }
-                if !headers.contains_key(REFERER) {
+                if !options.headers.contains_key(REFERER) {
                     request =
                         request.header(REFERER, format!("{}/", url.origin().ascii_serialization()));
                 }
@@ -303,10 +347,10 @@ impl SiteHttp {
                     request = request.header(COOKIE, cookie);
                 }
                 if request_method == Method::POST {
-                    if let Some(body) = body {
+                    if let Some(body) = options.json {
                         request = request.json(body);
                     }
-                    if let Some(form) = form {
+                    if let Some(form) = options.form {
                         request = request.form(form);
                     }
                 }
@@ -351,6 +395,9 @@ impl SiteHttp {
                     .to_str()?;
                 let next = url.join(location)?;
                 url = validate_site_url(next.as_str(), platform)?;
+                if options.stop_at.is_some_and(|predicate| predicate(&url)) {
+                    return Ok(SiteResponse::RedirectTarget(url));
+                }
                 if matches!(response.status().as_u16(), 301..=303) {
                     request_method = Method::GET;
                 }
@@ -359,26 +406,32 @@ impl SiteHttp {
             match response.status().as_u16() {
                 401 | 403 | 412 => {
                     state.blocked_until = Instant::now() + self.cooldown;
-                    bail!(
+                    return Err(SiteAccessRestricted(format!(
                         "{platform} 要求登录或触发访问验证（HTTP {}），已进入冷却，请配置 auth.cookies.{platform} 或 auth.cookieFiles.{platform}",
                         response.status().as_u16()
-                    );
+                    )).into());
                 }
                 429 => {
-                    let delay =
-                        retry_after(response.headers().get(RETRY_AFTER)).unwrap_or(self.cooldown);
+                    let retry_after = retry_after(response.headers().get(RETRY_AFTER));
+                    let delay = retry_after.unwrap_or(self.cooldown);
                     state.blocked_until = Instant::now() + delay;
-                    bail!(
-                        "{platform} 请求受限，已按 Retry-After 冷却 {} 秒",
+                    let hint = if retry_after.is_some() {
+                        "按 Retry-After "
+                    } else {
+                        ""
+                    };
+                    return Err(SiteAccessRestricted(format!(
+                        "{platform} 请求受限（HTTP 429），已{hint}冷却 {} 秒",
                         delay.as_secs()
-                    );
+                    ))
+                    .into());
                 }
                 _ => {}
             }
             if !response.status().is_success() {
                 bail!("{platform} 返回 HTTP {}", response.status().as_u16());
             }
-            return Ok(response);
+            return Ok(SiteResponse::Final(response));
         }
         bail!("平台重定向次数过多")
     }
@@ -404,9 +457,28 @@ impl SiteHttp {
 
     pub async fn resolve_url(&self, url: &str, platform: &str) -> Result<String> {
         let response = self
-            .request(Method::GET, url, platform, HeaderMap::new(), None, None)
-            .await?;
+            .request(Method::GET, url, platform, RequestOptions::default())
+            .await?
+            .into_final()?;
         Ok(response.url().to_string())
+    }
+
+    pub(super) async fn resolve_douyin_short(&self, url: &str) -> Result<String> {
+        let result = self
+            .request(
+                Method::GET,
+                url,
+                "douyin",
+                RequestOptions {
+                    stop_at: Some(|url| super::sites_page::douyin_path_id(url).is_some()),
+                    ..RequestOptions::default()
+                },
+            )
+            .await?;
+        Ok(match result {
+            SiteResponse::Final(response) => response.url().to_string(),
+            SiteResponse::RedirectTarget(target) => target.into(),
+        })
     }
 
     pub async fn get_text(&self, url: &str, platform: &str) -> Result<String> {
@@ -420,8 +492,17 @@ impl SiteHttp {
         headers: HeaderMap,
     ) -> Result<String> {
         let response = self
-            .request(Method::GET, url, platform, headers, None, None)
-            .await?;
+            .request(
+                Method::GET,
+                url,
+                platform,
+                RequestOptions {
+                    headers,
+                    ..RequestOptions::default()
+                },
+            )
+            .await?
+            .into_final()?;
         self.text_response(response).await
     }
 
@@ -436,8 +517,11 @@ impl SiteHttp {
         headers: HeaderMap,
     ) -> Result<Value> {
         let text = self.get_text_headers(url, platform, headers).await?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("{platform} 返回页面验证或无效 JSON，请补充登录 Cookie"))
+        serde_json::from_str(&text).with_context(|| {
+            SiteJsonUnavailable(format!(
+                "{platform} 返回页面验证或无效 JSON，请检查登录状态"
+            ))
+        })
     }
 
     pub async fn post_json(&self, url: &str, platform: &str, body: &Value) -> Result<Value> {
@@ -446,11 +530,13 @@ impl SiteHttp {
                 Method::POST,
                 url,
                 platform,
-                HeaderMap::new(),
-                Some(body),
-                None,
+                RequestOptions {
+                    json: Some(body),
+                    ..RequestOptions::default()
+                },
             )
-            .await?;
+            .await?
+            .into_final()?;
         Ok(serde_json::from_str(&self.text_response(response).await?)?)
     }
 
@@ -465,11 +551,13 @@ impl SiteHttp {
                 Method::POST,
                 url,
                 platform,
-                HeaderMap::new(),
-                None,
-                Some(form),
+                RequestOptions {
+                    form: Some(form),
+                    ..RequestOptions::default()
+                },
             )
-            .await?;
+            .await?
+            .into_final()?;
         Ok(serde_json::from_str(&self.text_response(response).await?)?)
     }
 }
@@ -604,7 +692,9 @@ mod tests {
         let result = http
             .get_json("https://api.bilibili.com/x/web-interface/view", "bilibili")
             .await;
-        assert!(result.unwrap_err().to_string().contains("冷却期"));
+        let error = result.unwrap_err();
+        assert!(error.is::<SiteAccessRestricted>());
+        assert!(error.to_string().contains("冷却期"));
         assert!(!http.is_cooling_down("douyin").await);
     }
 }

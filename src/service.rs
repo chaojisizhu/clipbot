@@ -285,13 +285,18 @@ impl AppState {
         let mut parsed_results: Vec<(LinkMatch, ParsedData, String, DedupClaim)> = Vec::new();
         let mut failed_errors = Vec::new();
         for (item, claim) in pending {
+            let started = Instant::now();
             match self.parser.parse_url(&item.url, &item.media_type).await {
                 crate::parser::api::ParseResult::Success(data) => {
+                    info!(platform = %item.media_type, elapsed_ms = started.elapsed().as_millis(), "作品解析完成");
                     let text = generate_formatted_text(&data, &self.config.output.format);
                     parsed_results.push((item, data, text, claim));
                 }
                 crate::parser::api::ParseResult::Failure(message) => {
-                    warn!("解析失败 [{}]: {message}", item.url);
+                    warn!(
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "解析失败 [{}]: {message}", item.url
+                    );
                     failed_errors.push(render_parse_error(&self.config, &item.url, &message));
                 }
             }
@@ -595,18 +600,41 @@ impl AppState {
         let mut video_failed_note = String::new();
         if is_video && self.config.output.show_video_file {
             let relay_video = || async {
-                let temporary = download_parsed_temp(&parsed, &self.config).await?;
+                let download_started = Instant::now();
+                let temporary =
+                    download_parsed_temp(&parsed, &self.config)
+                        .await
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "下载或合流失败（{} ms）: {error}",
+                                download_started.elapsed().as_millis()
+                            )
+                        })?;
+                let download_ms = download_started.elapsed().as_millis();
+                let upload_started = Instant::now();
                 let file_name = format!("video_{}.mp4", chrono::Utc::now().timestamp_millis());
                 let upload = self
                     .upload_media_file(event, 2, &file_name, temporary.path())
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "QQ 上传失败（{} ms，下载 {} ms）: {error}",
+                            upload_started.elapsed().as_millis(),
+                            download_ms
+                        )
+                    })?;
                 let file_info = upload
                     .get("file_info")
                     .and_then(Value::as_str)
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("分片上传响应缺少 file_info"))?
                     .to_string();
-                info!("视频已本地上传中转 ({}MB)", temporary.size() / 1024 / 1024);
+                info!(
+                    bytes = temporary.size(),
+                    download_ms,
+                    qq_upload_ms = upload_started.elapsed().as_millis(),
+                    "视频已本地上传中转"
+                );
                 Ok::<String, anyhow::Error>(file_info)
             };
 

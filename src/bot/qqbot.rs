@@ -4,11 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, TryStreamExt};
 use serde_json::{Value, json};
 use sha1::{Digest as Sha1Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::{MissedTickBehavior, interval_at};
 use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -25,6 +25,7 @@ pub const INTENT_GROUP_AND_C2C: u64 = 1 << 25;
 const PASSIVE_FALLBACK_CODES: &[i64] = &[40_034_128, 40_034_005, 40_034_026, 304_027];
 const DUPLICATE_SEQ_CODE: i64 = 40_054_005;
 const UPLOAD_BUFFER_SIZE: usize = 64 * 1024;
+const MAX_FILE_UPLOAD_CONCURRENCY: u64 = 2;
 const UPLOAD_HEAD_SIZE: u64 = 10_002_432;
 pub const MARKDOWN_IMAGE_MAX_BYTES: usize = 10_000_000;
 
@@ -1161,63 +1162,23 @@ impl QQBotClient {
             .filter(|id| !id.is_empty())
             .ok_or_else(|| QQBotError::Other("upload_prepare 缺少 upload_id".into()))?;
         let parts = upload_parts(&prepare, size)?;
-        // A fresh file handle is used for each request body. The stream owns its
-        // reader and yields at most 64 KiB even for very large server blocks.
-        for part in parts {
-            file.seek(std::io::SeekFrom::Start(part.offset))
-                .await
-                .map_err(anyhow::Error::from)?;
-            let mut remaining = part.length;
-            let mut block_md5 = md5::Context::new();
-            while remaining > 0 {
-                let count = remaining.min(buffer.len() as u64) as usize;
-                file.read_exact(&mut buffer[..count])
-                    .await
-                    .map_err(anyhow::Error::from)?;
-                block_md5.consume(&buffer[..count]);
-                remaining -= count as u64;
-            }
-            let mut body_file = tokio::fs::File::open(path)
-                .await
-                .map_err(anyhow::Error::from)?;
-            body_file
-                .seek(std::io::SeekFrom::Start(part.offset))
-                .await
-                .map_err(anyhow::Error::from)?;
-            let stream = futures_util::stream::try_unfold(
-                (body_file, part.length),
-                |(mut file, remaining)| async move {
-                    if remaining == 0 {
-                        return Ok::<_, std::io::Error>(None);
-                    }
-                    let mut chunk = vec![0u8; remaining.min(UPLOAD_BUFFER_SIZE as u64) as usize];
-                    file.read_exact(&mut chunk).await?;
-                    let remaining = remaining - chunk.len() as u64;
-                    Ok(Some((chunk, (file, remaining))))
-                },
-            );
-            self.upload_http
-                .put(&part.url)
-                .header("Content-Type", "application/octet-stream")
-                .header("Content-Length", part.length)
-                .body(reqwest::Body::wrap_stream(stream))
-                .send()
-                .await?
-                .error_for_status()?;
-            self.api_call(
-                reqwest::Method::POST,
-                &format!("{base_path}/upload_part_finish"),
-                Some(&json!({
-                    "upload_id": upload_id,
-                    "part_index": part.index,
-                    "block_size": part.length,
-                    "md5": format!("{:x}", block_md5.compute())
-                })),
-                false,
-                Duration::from_secs(30),
-            )
+        let concurrency = prepare
+            .get("concurrency")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, MAX_FILE_UPLOAD_CONCURRENCY) as usize;
+        info!(
+            parts = parts.len(),
+            concurrent_parts = parts.len().min(concurrency),
+            "QQ 文件上传分片已准备"
+        );
+        drop(file);
+        drop(buffer);
+        futures_util::stream::iter(parts.into_iter().map(Ok))
+            .try_for_each_concurrent(concurrency, |part| {
+                self.upload_file_part(base_path, upload_id, path, part)
+            })
             .await?;
-        }
         self.api_call(
             reqwest::Method::POST,
             &format!("{base_path}/files"),
@@ -1226,6 +1187,73 @@ impl QQBotClient {
             Duration::from_secs(30),
         )
         .await
+    }
+
+    async fn upload_file_part(
+        &self,
+        base_path: &str,
+        upload_id: &str,
+        path: &Path,
+        part: UploadPart,
+    ) -> Result<(), QQBotError> {
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .map_err(anyhow::Error::from)?;
+        file.seek(std::io::SeekFrom::Start(part.offset))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let (digest_tx, mut digest_rx) = oneshot::channel();
+        let stream = futures_util::stream::try_unfold(
+            Some((file, part.length, md5::Context::new(), digest_tx)),
+            |state| async move {
+                let Some((mut file, remaining, mut digest, digest_tx)) = state else {
+                    return Ok::<_, std::io::Error>(None);
+                };
+                let mut chunk = vec![0u8; remaining.min(UPLOAD_BUFFER_SIZE as u64) as usize];
+                file.read_exact(&mut chunk).await?;
+                digest.consume(&chunk);
+                let next = if remaining == chunk.len() as u64 {
+                    let _ = digest_tx.send(digest.compute());
+                    None
+                } else {
+                    Some((file, remaining - chunk.len() as u64, digest, digest_tx))
+                };
+                Ok(Some((chunk, next)))
+            },
+        );
+        let response = self
+            .upload_http
+            .put(&part.url)
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", part.length)
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
+            .await
+            .map_err(reqwest::Error::without_url)?;
+        if !response.status().is_success() {
+            return Err(QQBotError::Other(format!(
+                "QQ 分片上传失败（HTTP {}）",
+                response.status().as_u16()
+            )));
+        }
+        // An early response is not proof that the request body was fully read.
+        let digest = digest_rx
+            .try_recv()
+            .map_err(|_| QQBotError::Other("QQ 分片请求未完整读取上传数据".into()))?;
+        self.api_call(
+            reqwest::Method::POST,
+            &format!("{base_path}/upload_part_finish"),
+            Some(&json!({
+                "upload_id": upload_id,
+                "part_index": part.index,
+                "block_size": part.length,
+                "md5": format!("{digest:x}")
+            })),
+            false,
+            Duration::from_secs(30),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn upload_media_data(

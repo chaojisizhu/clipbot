@@ -8,7 +8,10 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use url::Url;
 
-use crate::parser::http::{MOBILE_USER_AGENT, SiteHttp, USER_AGENT};
+use crate::parser::http::{
+    MOBILE_USER_AGENT, SiteAccessRestricted, SiteHttp, SiteJsonUnavailable, USER_AGENT,
+    domain_matches,
+};
 use crate::types::{ImageSize, LivePhoto, ParsedData, VideoQuality};
 
 static SCRIPTS: Lazy<Regex> =
@@ -16,8 +19,20 @@ static SCRIPTS: Lazy<Regex> =
 static META: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<meta\b([^>]+)>").unwrap());
 static ATTRS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?is)([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
-static DOUDOU_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"/(?:video|note)/(\d+)").unwrap());
 const DOUYIN_APP_UA: &str = "com.ss.android.ugc.aweme/290101 (Linux; U; Android 10; zh_CN; Pixel 4; Build/QQ3A.200805.001; Cronet/TTNetVersion:5f9037be 2023-01-13 QuicVersion:4668bb42 2022-11-21)";
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DouyinMediaUnavailable;
+
+impl std::fmt::Display for DouyinMediaUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "抖音分享页未提供可下载的作品媒体，请检查原帖是否可访问，需登录时请配置对应域的 auth.cookieFiles.douyin",
+        )
+    }
+}
+
+impl std::error::Error for DouyinMediaUnavailable {}
 
 /// Read only data delivered by the original site's public page.
 pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedData> {
@@ -82,9 +97,7 @@ async fn douyin_feed(http: &SiteHttp, id: &str) -> Result<Option<ParsedData>> {
                 }
             }
             Err(error)
-                if ["冷却", "登录", "验证"]
-                    .iter()
-                    .any(|keyword| error.to_string().contains(keyword)) =>
+                if error.is::<SiteAccessRestricted>() || error.is::<SiteJsonUnavailable>() =>
             {
                 return Err(error);
             }
@@ -152,12 +165,12 @@ pub fn parse_page(html: &str, url: &str, platform: &str) -> Result<ParsedData> {
     if parsed.has_media() {
         return Ok(parsed);
     }
+    if platform == "douyin" {
+        return Err(DouyinMediaUnavailable.into());
+    }
     let message = match platform {
         "xiaohongshu" => {
             "小红书未提供可访问的笔记媒体，请保留分享链接的 xsec_token，并补充 auth.cookies.xiaohongshu 登录 Cookie"
-        }
-        "douyin" => {
-            "抖音分享页未提供作品媒体，可能触发风控或作品权限限制，请补充 auth.cookies.douyin 登录 Cookie"
         }
         "kuaishou" => {
             "快手页面未提供作品媒体，可能需要登录或网页验证，请补充 auth.cookies.kuaishou 登录 Cookie"
@@ -170,20 +183,34 @@ pub fn parse_page(html: &str, url: &str, platform: &str) -> Result<ParsedData> {
     bail!("{platform}: {message}")
 }
 
-fn douyin_id(url: &str) -> Option<String> {
-    DOUDOU_ID
-        .captures(url)
-        .map(|capture| capture[1].to_owned())
-        .or_else(|| {
-            let parsed = Url::parse(url).ok()?;
-            parsed
-                .query_pairs()
-                .find(|(key, _)| matches!(key.as_ref(), "modal_id" | "aweme_id"))
-                .map(|(_, value)| value.into_owned())
-                .filter(|value| {
-                    !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
-                })
-        })
+pub(super) fn douyin_path_id(url: &Url) -> Option<&str> {
+    let host = url.host_str()?;
+    if !domain_matches(host, "douyin.com") && !domain_matches(host, "iesdouyin.com") {
+        return None;
+    }
+    let raw_path = url.path().trim_end_matches('/');
+    let mut segments = raw_path.strip_prefix('/')?.split('/');
+    let id = match segments.next()? {
+        "video" | "note" => segments.next()?,
+        "share" if matches!(segments.next(), Some("video" | "note")) => segments.next()?,
+        _ => return None,
+    };
+    (segments.next().is_none() && is_douyin_id(id)).then_some(id)
+}
+
+pub(super) fn douyin_id(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    douyin_path_id(&url).map(str::to_owned).or_else(|| {
+        url.query_pairs()
+            .find(|(key, value)| {
+                matches!(key.as_ref(), "modal_id" | "aweme_id") && is_douyin_id(value)
+            })
+            .map(|(_, value)| value.into_owned())
+    })
+}
+
+fn is_douyin_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn item_id(url: &str, platform: &str) -> String {
@@ -1265,6 +1292,30 @@ mod tests {
             "https://cdn.example.org/right.mp4"
         );
         assert!(map_douyin_feed(&data, "456").is_none());
+    }
+
+    #[test]
+    fn douyin_short_link_stop_requires_an_exact_work_path() {
+        for url in [
+            "https://www.douyin.com/video/123?tracking=example",
+            "https://www.douyin.com/note/123",
+            "https://www.iesdouyin.com/share/video/123/",
+        ] {
+            assert_eq!(douyin_path_id(&Url::parse(url).unwrap()), Some("123"));
+        }
+        for url in [
+            "https://v.douyin.com/one-hop",
+            "https://www.douyin.com/redirect?modal_id=123",
+            "https://www.douyin.com/video/123more",
+            "https://www.douyin.com/video/123/verify",
+            "https://aweme.snssdk.com/video/123",
+        ] {
+            assert_eq!(douyin_path_id(&Url::parse(url).unwrap()), None);
+        }
+        assert_eq!(
+            douyin_id("https://www.douyin.com/user/current?modal_id=123").as_deref(),
+            Some("123")
+        );
     }
 
     #[test]
