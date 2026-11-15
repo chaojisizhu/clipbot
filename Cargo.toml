@@ -1,6 +1,6 @@
 [package]
 name = "videorust"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 description = "Rust 原站视频图集解析与 QQ 官方机器人"
 license = "MIT"
@@ -29,6 +29,7 @@ serde_yaml = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
 thiserror = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "io-util", "process", "signal"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 tracing = "0.1"
@@ -38,7 +39,6 @@ urlencoding = "2"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
-tempfile = "3"
 
 [profile.release]
 strip = true

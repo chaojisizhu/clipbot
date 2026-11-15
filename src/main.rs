@@ -8,7 +8,7 @@ use videorust::bot::qqbot::QQBotClient;
 use videorust::config::load_config;
 use videorust::parser::api::{ParseResult, VideoParserService};
 use videorust::parser::matcher::link_type_parser;
-use videorust::parser::remux::download_parsed_temp;
+use videorust::parser::remux::{download_live_album_temp, download_parsed_temp};
 use videorust::service::AppState;
 use videorust::types::{AppConfig, BotEvent};
 
@@ -95,6 +95,23 @@ async fn run() -> Result<()> {
                 let result = parser.parse_url(&hit.url, &hit.media_type).await;
                 if command == "probe" {
                     match &result {
+                        ParseResult::Success(data)
+                            if hit.media_type == "douyin"
+                                && data.media_type == "live_photo"
+                                && !data.live_photo.is_empty() =>
+                        {
+                            let file = download_live_album_temp(data, &config).await?;
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status": "success",
+                                    "platform": hit.media_type,
+                                    "clips": data.live_photo.len(),
+                                    "mergedBytes": file.size(),
+                                    "cleanupOnExit": true,
+                                })
+                            );
+                        }
                         ParseResult::Success(data) if !data.video.is_empty() => {
                             let file = download_parsed_temp(data, &config).await?;
                             println!(

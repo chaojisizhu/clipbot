@@ -53,7 +53,7 @@ struct CacheEntry {
 enum CacheValue {
     Media(Box<ParsedData>),
     DouyinRedirect(String),
-    DouyinUnavailable,
+    DouyinUnavailable(DouyinMediaUnavailable),
 }
 
 pub struct VideoParserService {
@@ -108,7 +108,7 @@ impl VideoParserService {
                 .map(|bytes| bytes.len())
                 .unwrap_or(usize::MAX),
             CacheValue::DouyinRedirect(url) => url.len(),
-            CacheValue::DouyinUnavailable => 0,
+            CacheValue::DouyinUnavailable(_) => 0,
         };
         let weight = value_weight.saturating_add(key.len());
         let budget = self.config.resources.max_cache_bytes.min(64 * 1024 * 1024);
@@ -147,7 +147,7 @@ impl VideoParserService {
     fn cached_result(&self, key: &str) -> Option<Result<ParsedData>> {
         match self.cached(key)? {
             CacheValue::Media(data) => Some(Ok(*data)),
-            CacheValue::DouyinUnavailable => Some(Err(DouyinMediaUnavailable.into())),
+            CacheValue::DouyinUnavailable(error) => Some(Err(error.into())),
             CacheValue::DouyinRedirect(_) => None,
         }
     }
@@ -224,8 +224,8 @@ impl VideoParserService {
         let mut data = match result {
             Ok(data) => data,
             Err(error) => {
-                if error.is::<DouyinMediaUnavailable>() {
-                    self.cache_value(key, CacheValue::DouyinUnavailable, 30);
+                if let Some(reason) = error.downcast_ref::<DouyinMediaUnavailable>() {
+                    self.cache_value(key, CacheValue::DouyinUnavailable(*reason), 30);
                 }
                 return Err(error);
             }
@@ -322,7 +322,9 @@ impl VideoParserService {
         if let Err(error) = &native {
             if error.is::<SiteAccessRestricted>()
                 || error.is::<DouyinMediaUnavailable>()
-                || platform == "douyin" && error.is::<SiteJsonUnavailable>()
+                || platform == "douyin"
+                    && (error.is::<SiteJsonUnavailable>()
+                        || sites_page::douyin_slides_id(resolved).is_some())
             {
                 return native;
             }
@@ -463,6 +465,11 @@ fn is_short_link(raw: &str) -> bool {
 
 fn parse_cache_key(url: &str, platform: &str) -> String {
     if platform == "douyin"
+        && let Some(id) = sites_page::douyin_slides_id(url)
+    {
+        return format!("douyin:slides:{id}");
+    }
+    if platform == "douyin"
         && let Some(id) = sites_page::douyin_id(url)
     {
         return format!("douyin:work:{id}");
@@ -505,7 +512,11 @@ mod tests {
             CacheValue::DouyinRedirect(share.into()),
             300,
         );
-        service.cache_value(key.clone(), CacheValue::DouyinUnavailable, 30);
+        service.cache_value(
+            key.clone(),
+            CacheValue::DouyinUnavailable(DouyinMediaUnavailable::Work),
+            30,
+        );
         let expiry = service.cache.lock().unwrap().get(&key).unwrap().expires;
         assert!(expiry.saturating_duration_since(Instant::now()) <= Duration::from_secs(30));
 

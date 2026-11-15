@@ -29,13 +29,14 @@ use crate::parser::materials::{OwnedMaterials, unix_now};
 use crate::parser::media::{
     download_media_buffer_with_headers, head_content_length, is_foreign_url,
 };
-use crate::parser::remux::download_parsed_temp;
+use crate::parser::remux::{download_live_album_temp, download_parsed_temp};
 use crate::types::{
     AppConfig, ChatType, DEFAULT_MAX_MARKDOWN_IMAGES, ImageSize, LinkMatch, ParsedData, QQChatEvent,
 };
 
 static ARCHIVE_EXT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\.(7z|zip)$").unwrap());
 static JM_TASK_GATE: Semaphore = Semaphore::const_new(1);
+static LIVE_ALBUM_GATE: Semaphore = Semaphore::const_new(1);
 
 pub struct AppState {
     config: Arc<AppConfig>,
@@ -317,7 +318,7 @@ impl AppState {
 
         let result_count = parsed_results.len();
         let mut delivered_count = 0usize;
-        for (_, parsed, text, mut claim) in parsed_results {
+        for (item, parsed, text, mut claim) in parsed_results {
             if let Some(attachment) = parsed.attachment.clone() {
                 if self.send_attachment(&event, &attachment).await {
                     claim.commit();
@@ -325,7 +326,15 @@ impl AppState {
                 }
                 continue;
             }
-            if self.send_media_result(&event, parsed, text).await {
+            let delivered = if item.media_type == "douyin"
+                && parsed.media_type == "live_photo"
+                && self.config.output.show_video_file
+            {
+                self.send_live_album_result(&event, &parsed, &text).await
+            } else {
+                self.send_media_result(&event, parsed, text).await
+            };
+            if delivered {
                 claim.commit();
                 delivered_count += 1;
             }
@@ -575,6 +584,94 @@ impl AppState {
             .await;
         }
         succeeded
+    }
+
+    async fn send_live_album_result(
+        &self,
+        event: &QQChatEvent,
+        parsed: &ParsedData,
+        text: &str,
+    ) -> bool {
+        if parsed.live_photo.is_empty() {
+            self.send_message(event, text_payload("抖音只返回了静态图片，下面是原图集。"))
+                .await;
+            return self.send_gallery_result(event, parsed, text).await;
+        }
+        let started = Instant::now();
+        let Ok(permit) = LIVE_ALBUM_GATE.try_acquire() else {
+            self.send_message(
+                event,
+                text_payload("另一个实况图集正在合并，先发原图。想看视频可以稍后重试。"),
+            )
+            .await;
+            self.send_gallery_result(event, parsed, text).await;
+            return false;
+        };
+        let file_info = async {
+            let video = download_live_album_temp(parsed, &self.config).await?;
+            let file_name = format!("live_album_{}.mp4", random_suffix(12));
+            let upload = self
+                .upload_media_file(event, 2, &file_name, video.path())
+                .await?;
+            let file_info = file_info_from_upload(upload)?;
+            info!(
+                clips = parsed.live_photo.len(),
+                bytes = video.size(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "抖音实况图集已合并并上传"
+            );
+            Ok::<_, anyhow::Error>(file_info)
+        }
+        .await;
+        drop(permit);
+
+        let file_info = match file_info {
+            Ok(file_info) => file_info,
+            Err(error) => {
+                warn!("抖音实况图集无法合并或上传: {error}");
+                self.send_message(
+                    event,
+                    text_payload("实况短片暂时无法合并发送，下面是原图集。"),
+                )
+                .await;
+                return self.send_gallery_result(event, parsed, text).await;
+            }
+        };
+        match self.bot.reply(event, &media_payload(file_info)).await {
+            Ok(_) => {}
+            Err(QQBotError::Api(error)) => {
+                warn!("QQ 拒绝发送合并后的实况视频: {error}");
+                self.send_message(event, text_payload("QQ 拒绝发送实况视频，下面是原图集。"))
+                    .await;
+                return self.send_gallery_result(event, parsed, text).await;
+            }
+            Err(error) => {
+                warn!("实况视频发送结果未确认: {error}");
+                self.send_message(
+                    event,
+                    text_payload("实况视频发送结果未确认，请查看是否已收到。"),
+                )
+                .await;
+                return false;
+            }
+        }
+        let static_pages = parsed.images.len().saturating_sub(parsed.live_photo.len());
+        let mut caption = if self.config.output.show_image_text {
+            text.to_owned()
+        } else {
+            String::new()
+        };
+        if static_pages > 0 {
+            caption.push_str(&format!(
+                "\n已按顺序合并 {} 段实况短片。另有 {static_pages} 页只取得静态图，未纳入视频。",
+                parsed.live_photo.len()
+            ));
+        }
+        if !caption.trim().is_empty() {
+            self.send_message(event, markdown_payload(caption, false))
+                .await;
+        }
+        true
     }
 
     async fn send_media_result(

@@ -21,14 +21,27 @@ static ATTRS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?is)([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')"#).unwrap());
 const DOUYIN_APP_UA: &str = "com.ss.android.ugc.aweme/290101 (Linux; U; Android 10; zh_CN; Pixel 4; Build/QQ3A.200805.001; Cronet/TTNetVersion:5f9037be 2023-01-13 QuicVersion:4668bb42 2022-11-21)";
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct DouyinMediaUnavailable;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DouyinMediaUnavailable {
+    Work,
+    Slides,
+    SlidesFiltered(u64),
+}
 
 impl std::fmt::Display for DouyinMediaUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(
-            "抖音分享页未提供可下载的作品媒体，请检查原帖是否可访问，需登录时请配置对应域的 auth.cookieFiles.douyin",
-        )
+        match self {
+            Self::Work => formatter.write_str(
+                "抖音分享页未提供可下载的作品媒体，请检查原帖是否可访问，需登录时请配置对应域的 auth.cookieFiles.douyin",
+            ),
+            Self::Slides => formatter.write_str(
+                "抖音未返回此图集的媒体详情，请在抖音确认原帖是否可播放",
+            ),
+            Self::SlidesFiltered(reason) => write!(
+                formatter,
+                "抖音未返回此图集的媒体详情（原站过滤码 {reason}），请在抖音确认原帖是否可播放",
+            ),
+        }
     }
 }
 
@@ -36,6 +49,11 @@ impl std::error::Error for DouyinMediaUnavailable {}
 
 /// Read only data delivered by the original site's public page.
 pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedData> {
+    if platform == "douyin"
+        && let Some(id) = douyin_slides_id(url)
+    {
+        return parse_douyin_slides(http, url, &id).await;
+    }
     if platform == "douyin"
         && let Some(id) = douyin_id(url)
         && let Some(mut parsed) = douyin_feed(http, &id).await?
@@ -71,6 +89,95 @@ pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedD
     let mut parsed = parse_page(&html, url, platform)?;
     set_media_headers(&mut parsed, &target, platform);
     Ok(parsed)
+}
+
+async fn parse_douyin_slides(http: &SiteHttp, url: &str, id: &str) -> Result<ParsedData> {
+    let share_url = format!("https://www.iesdouyin.com/share/slides/{id}/");
+    let page_url = if Url::parse(url).ok().is_some_and(|url| {
+        url.host_str()
+            .is_some_and(|host| domain_matches(host, "iesdouyin.com"))
+    }) {
+        url
+    } else {
+        &share_url
+    };
+    let html = http.get_text(page_url, "douyin").await?;
+    let page_media = embedded_states(&html)
+        .iter()
+        .filter_map(|state| {
+            find_item(state, id, &["aweme_id", "awemeId"], |item| {
+                aweme_images(item).is_some()
+            })
+            .map(map_aweme)
+        })
+        .filter(|data| !data.images.is_empty())
+        .max_by_key(|data| (data.live_photo.len(), data.images.len()));
+    let page_media = match page_media {
+        Some(mut data) if data.live_photo.len() == data.images.len() => {
+            set_media_headers(&mut data, page_url, "douyin");
+            return Ok(data);
+        }
+        other => other,
+    };
+    let mut endpoint = Url::parse("https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/")?;
+    endpoint
+        .query_pairs_mut()
+        .append_pair("aweme_ids", &format!("[{id}]"));
+    let detail = http
+        .get_json(endpoint.as_str(), "douyin")
+        .await
+        .and_then(|value| map_douyin_slides_detail(&value, id).map_err(Into::into));
+    let mut parsed = match (detail, page_media) {
+        (Ok(mut detail), Some(page)) => {
+            if page.live_photo.len() > detail.live_photo.len() {
+                detail.live_photo = page.live_photo;
+            }
+            if page.images.len() > detail.images.len() {
+                detail.images = page.images;
+                detail.image_size_map = page.image_size_map;
+            }
+            if page.media_type == "live_photo" {
+                detail.media_type = page.media_type;
+            }
+            detail
+        }
+        (Ok(detail), _) => detail,
+        (Err(_), Some(page)) => page,
+        (Err(error), None) => return Err(error),
+    };
+    set_media_headers(&mut parsed, page_url, "douyin");
+    Ok(parsed)
+}
+
+fn map_douyin_slides_detail(data: &Value, id: &str) -> Result<ParsedData, DouyinMediaUnavailable> {
+    if let Some(work) = data
+        .get("aweme_details")
+        .and_then(Value::as_array)
+        .and_then(|details| {
+            details
+                .iter()
+                .find(|item| text(item, &["/aweme_id", "/awemeId"]) == id)
+        })
+        .filter(|item| aweme_images(item).is_some())
+    {
+        let parsed = map_aweme(work);
+        if !parsed.images.is_empty() {
+            return Ok(parsed);
+        }
+    }
+    if let Some(reason) = data
+        .get("filter_list")
+        .and_then(Value::as_array)
+        .and_then(|filters| {
+            filters
+                .iter()
+                .find(|item| text(item, &["/aweme_id", "/awemeId"]) == id)
+        })
+        .and_then(|filter| filter.get("reason").and_then(Value::as_u64))
+    {
+        return Err(DouyinMediaUnavailable::SlidesFiltered(reason));
+    }
+    Err(DouyinMediaUnavailable::Slides)
 }
 
 async fn douyin_feed(http: &SiteHttp, id: &str) -> Result<Option<ParsedData>> {
@@ -166,7 +273,7 @@ pub fn parse_page(html: &str, url: &str, platform: &str) -> Result<ParsedData> {
         return Ok(parsed);
     }
     if platform == "douyin" {
-        return Err(DouyinMediaUnavailable.into());
+        return Err(DouyinMediaUnavailable::Work.into());
     }
     let message = match platform {
         "xiaohongshu" => {
@@ -184,18 +291,31 @@ pub fn parse_page(html: &str, url: &str, platform: &str) -> Result<ParsedData> {
 }
 
 pub(super) fn douyin_path_id(url: &Url) -> Option<&str> {
+    douyin_work_path(url).map(|(_, id)| id)
+}
+
+pub(super) fn douyin_slides_id(url: &str) -> Option<String> {
+    let url = Url::parse(url).ok()?;
+    let (kind, id) = douyin_work_path(&url)?;
+    (kind == "slides").then(|| id.to_owned())
+}
+
+fn douyin_work_path(url: &Url) -> Option<(&str, &str)> {
     let host = url.host_str()?;
     if !domain_matches(host, "douyin.com") && !domain_matches(host, "iesdouyin.com") {
         return None;
     }
     let raw_path = url.path().trim_end_matches('/');
     let mut segments = raw_path.strip_prefix('/')?.split('/');
-    let id = match segments.next()? {
-        "video" | "note" => segments.next()?,
-        "share" if matches!(segments.next(), Some("video" | "note")) => segments.next()?,
-        _ => return None,
+    let first = segments.next()?;
+    let kind = if first == "share" {
+        segments.next()?
+    } else {
+        first
     };
-    (segments.next().is_none() && is_douyin_id(id)).then_some(id)
+    let id = segments.next()?;
+    (matches!(kind, "video" | "note" | "slides") && segments.next().is_none() && is_douyin_id(id))
+        .then_some((kind, id))
 }
 
 pub(super) fn douyin_id(url: &str) -> Option<String> {
@@ -449,7 +569,22 @@ fn set_type(parsed: &mut ParsedData) {
 
 fn is_aweme(value: &Value) -> bool {
     (value.get("aweme_id").is_some() || value.get("awemeId").is_some())
-        && (value.get("video").is_some() || value.get("images").is_some())
+        && (value.get("video").is_some() || aweme_images(value).is_some())
+}
+
+fn aweme_images(item: &Value) -> Option<&[Value]> {
+    [
+        "/image_post_info/images",
+        "/image_post_info/image_list",
+        "/imagePostInfo/images",
+        "/imagePostInfo/imageList",
+        "/images",
+        "/image_list",
+    ]
+    .into_iter()
+    .filter_map(|pointer| item.pointer(pointer)?.as_array())
+    .find(|images| !images.is_empty())
+    .map(Vec::as_slice)
 }
 
 fn map_aweme(item: &Value) -> ParsedData {
@@ -489,12 +624,19 @@ fn map_aweme(item: &Value) -> ParsedData {
         ..ParsedData::default()
     };
     let mut sizes = HashMap::new();
-    if let Some(images) = item.get("images").and_then(Value::as_array) {
+    let mut has_live_slide = false;
+    let aweme_images = aweme_images(item);
+    if let Some(images) = aweme_images {
         for image in images {
+            has_live_slide |= number(image, &["/live_photo_type", "/livePhotoType"]) == 1
+                || number(image, &["/clip_type", "/clipType"]) == 5;
             let url = url_at(
                 image,
                 &[
                     "/url_list/0",
+                    "/urlList/0/src",
+                    "/urlList/0/url",
+                    "/urlList/0",
                     "/display_image/url_list/0",
                     "/download_url_list/0",
                 ],
@@ -505,7 +647,15 @@ fn map_aweme(item: &Value) -> ParsedData {
                 }
                 let live_video = url_at(
                     image,
-                    &["/video/play_addr/url_list/0", "/video/playAddr/0/src"],
+                    &[
+                        "/video/play_addr_h264/url_list/0",
+                        "/video/play_addr/url_list/0",
+                        "/video/playAddr/0/src",
+                        "/video/playAddr/0/url",
+                        "/video/playAddr/0",
+                        "/video_play_addr/url_list/0",
+                        "/video_download_addr/url_list/0",
+                    ],
                 );
                 if !live_video.is_empty() {
                     result.live_photo.push(LivePhoto {
@@ -521,7 +671,7 @@ fn map_aweme(item: &Value) -> ParsedData {
         result.image_size_map = Some(sizes);
     }
     // Image posts can expose their background MP3 as video.play_addr.
-    if result.images.is_empty() {
+    if aweme_images.is_none() {
         let video = item.get("video").unwrap_or(&Value::Null);
         if let Some(rates) = video
             .get("bit_rate")
@@ -575,6 +725,9 @@ fn map_aweme(item: &Value) -> ParsedData {
         result.cover = result.images.first().cloned().unwrap_or_default();
     }
     set_type(&mut result);
+    if has_live_slide || !result.live_photo.is_empty() {
+        result.media_type = "live_photo".into();
+    }
     result
 }
 
@@ -1300,6 +1453,7 @@ mod tests {
             "https://www.douyin.com/video/123?tracking=example",
             "https://www.douyin.com/note/123",
             "https://www.iesdouyin.com/share/video/123/",
+            "https://www.iesdouyin.com/share/slides/123/",
         ] {
             assert_eq!(douyin_path_id(&Url::parse(url).unwrap()), Some("123"));
         }
@@ -1315,6 +1469,98 @@ mod tests {
         assert_eq!(
             douyin_id("https://www.douyin.com/user/current?modal_id=123").as_deref(),
             Some("123")
+        );
+    }
+
+    #[test]
+    fn douyin_slides_keep_their_image_order_and_clip_pairs() {
+        let details = serde_json::json!({
+            "aweme_details": [
+                {
+                    "aweme_id": "999",
+                    "images": [{"url_list": ["https://example.com/other.webp"]}]
+                },
+                {
+                    "aweme_id": "123",
+                    "desc": "实况图集",
+                    "image_post_info": {"images": [
+                        {
+                            "url_list": ["https://example.com/1.webp"],
+                            "video": {"play_addr": {"url_list": ["https://example.com/1.mp4"]}}
+                        },
+                        {"urlList": [{"src": "https://example.com/2.webp"}]},
+                        {
+                            "urlList": [{"src": "https://example.com/3.webp"}],
+                            "video": {"playAddr": [{"src": "https://example.com/3.mp4"}]}
+                        }
+                    ]},
+                    "video": {"play_addr": {"url_list": ["https://example.com/music.mp3"]}}
+                }
+            ]
+        });
+        let parsed = map_douyin_slides_detail(&details, "123").unwrap();
+        assert_eq!(parsed.media_type, "live_photo");
+        assert!(parsed.video.is_empty(), "background music is not the video");
+        assert_eq!(
+            parsed.images,
+            [
+                "https://example.com/1.webp",
+                "https://example.com/2.webp",
+                "https://example.com/3.webp"
+            ]
+        );
+        let clips: Vec<_> = parsed
+            .live_photo
+            .iter()
+            .map(|slide| (slide.image.as_str(), slide.video.as_str()))
+            .collect();
+        assert_eq!(
+            clips,
+            [
+                ("https://example.com/1.webp", "https://example.com/1.mp4"),
+                ("https://example.com/3.webp", "https://example.com/3.mp4")
+            ]
+        );
+    }
+
+    #[test]
+    fn douyin_slides_without_mp4_remain_a_static_gallery() {
+        let details = serde_json::json!({"aweme_details": [{
+            "aweme_id": "123",
+            "images": [{"url_list": ["https://example.com/1.webp"]}],
+            "video": {"play_addr": {"url_list": ["https://example.com/music.mp3"]}}
+        }]});
+        let parsed = map_douyin_slides_detail(&details, "123").unwrap();
+        assert_eq!(parsed.media_type, "image");
+        assert!(parsed.live_photo.is_empty() && parsed.video.is_empty());
+        assert_eq!(parsed.images, ["https://example.com/1.webp"]);
+    }
+
+    #[test]
+    fn known_live_slide_without_media_keeps_its_static_fallback() {
+        let details = serde_json::json!({"aweme_details": [{
+            "aweme_id": "123",
+            "images": [{"live_photo_type": 1, "url_list": ["https://example.com/1.webp"]}]
+        }]});
+        let parsed = map_douyin_slides_detail(&details, "123").unwrap();
+        assert_eq!(parsed.media_type, "live_photo");
+        assert!(parsed.live_photo.is_empty());
+        assert_eq!(parsed.images, ["https://example.com/1.webp"]);
+    }
+
+    #[test]
+    fn douyin_filter_reason_applies_only_to_the_requested_slides() {
+        let details = serde_json::json!({
+            "aweme_details": [],
+            "filter_list": [{"aweme_id": "123", "reason": 8}]
+        });
+        assert_eq!(
+            map_douyin_slides_detail(&details, "123").unwrap_err(),
+            DouyinMediaUnavailable::SlidesFiltered(8)
+        );
+        assert_eq!(
+            map_douyin_slides_detail(&details, "999").unwrap_err(),
+            DouyinMediaUnavailable::Slides
         );
     }
 

@@ -1,19 +1,29 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
+use serde_json::Value;
+use tokio::time::Instant;
 use url::Url;
 
 use crate::parser::media::{TempMedia, download_media_temp, is_foreign_url};
 use crate::parser::process::spawn_capture;
 use crate::types::{AppConfig, ParsedData};
 
-pub async fn download_parsed_temp(data: &ParsedData, config: &AppConfig) -> Result<TempMedia> {
-    let max_bytes = if config.output.max_video_size == 0 {
+const MAX_LIVE_ALBUM_CLIPS: usize = 12;
+const MAX_LIVE_ALBUM_BYTES: u64 = 64 * 1024 * 1024;
+const CONCAT_MANIFEST_BYTES: u64 = 4096;
+
+fn max_video_bytes(config: &AppConfig) -> u64 {
+    if config.output.max_video_size == 0 {
         190 * 1024 * 1024
     } else {
         config.output.max_video_size.saturating_mul(1024 * 1024)
-    };
+    }
+}
+
+pub async fn download_parsed_temp(data: &ParsedData, config: &AppConfig) -> Result<TempMedia> {
+    let max_bytes = max_video_bytes(config);
     let proxies = [config.api.proxy.clone(), config.ytdlp.proxy.clone()];
     let timeout = Duration::from_millis(config.output.video_download_timeout.max(1));
     let is_manifest = Url::parse(&data.video).ok().is_some_and(|url| {
@@ -122,4 +132,236 @@ pub async fn download_parsed_temp(data: &ParsedData, config: &AppConfig) -> Resu
     }
     temporary.finish()?;
     Ok(temporary)
+}
+
+struct ClipInfo {
+    streams: Vec<Value>,
+    duration: f64,
+}
+
+fn remaining_time(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ensure!(!remaining.is_zero(), "实况图集处理超时");
+    Ok(remaining)
+}
+
+fn ffprobe_for(ffmpeg: &str) -> String {
+    let filename = if cfg!(windows) {
+        "ffprobe.exe"
+    } else {
+        "ffprobe"
+    };
+    let candidate = Path::new(ffmpeg.trim()).with_file_name(filename);
+    if candidate.is_file() {
+        return candidate.to_string_lossy().into_owned();
+    }
+    filename.into()
+}
+
+async fn inspect_clip(ffprobe: &str, file: &Path, deadline: Instant) -> Result<ClipInfo> {
+    let args = vec![
+        "-v".into(),
+        "error".into(),
+        "-max_alloc".into(),
+        "16777216".into(),
+        "-protocol_whitelist".into(),
+        "file".into(),
+        "-f".into(),
+        "mov".into(),
+        "-show_data_hash".into(),
+        "sha256".into(),
+        "-show_entries".into(),
+        concat!(
+            "stream=codec_type,codec_name,codec_tag_string,profile,level,width,height,pix_fmt,",
+            "time_base,r_frame_rate,sample_aspect_ratio,sample_fmt,sample_rate,channels,",
+            "channel_layout,extradata_hash:stream_disposition=attached_pic:stream_side_data=rotation:",
+            "stream_tags=rotate:format=duration"
+        ).into(),
+        "-of".into(),
+        "json".into(),
+        file.to_string_lossy().into_owned(),
+    ];
+    let output = spawn_capture(ffprobe, &args, remaining_time(deadline)?)
+        .await
+        .context("无法用 ffprobe 检查实况短片")?;
+    let data: Value = serde_json::from_str(&output).context("无法识别实况短片的媒体信息")?;
+    let streams = data["streams"].as_array().context("实况短片缺少媒体流")?;
+    let duration = data
+        .pointer("/format/duration")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .context("实况短片时长无效")?;
+    let mut video_tracks = 0;
+    let mut audio_tracks = 0;
+    for stream in streams {
+        match (stream["codec_type"].as_str(), stream["codec_name"].as_str()) {
+            (Some("video"), Some("h264"))
+                if stream
+                    .pointer("/disposition/attached_pic")
+                    .and_then(Value::as_u64)
+                    == Some(0)
+                    && matches!(stream["pix_fmt"].as_str(), Some("yuv420p" | "yuvj420p"))
+                    && stream["width"].as_u64().is_some_and(|width| width > 0)
+                    && stream["height"].as_u64().is_some_and(|height| height > 0) =>
+            {
+                video_tracks += 1;
+            }
+            (Some("audio"), Some("aac")) => audio_tracks += 1,
+            _ => bail!("实况短片包含无法直接合并的媒体流"),
+        }
+        ensure!(
+            stream["extradata_hash"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("SHA256:")),
+            "无法确认实况短片的编码参数"
+        );
+    }
+    ensure!(
+        video_tracks == 1 && audio_tracks <= 1,
+        "实况短片音视频轨道不兼容"
+    );
+    Ok(ClipInfo {
+        streams: streams.clone(),
+        duration,
+    })
+}
+
+/// Download each live slide in source order, then join compatible MP4 streams.
+/// Both input and output file sizes count towards the shared temporary disk budget.
+pub async fn download_live_album_temp(data: &ParsedData, config: &AppConfig) -> Result<TempMedia> {
+    let deadline = Instant::now()
+        + Duration::from_millis(config.output.video_download_timeout.clamp(1, 300_000));
+    let clips = &data.live_photo;
+    ensure!(!clips.is_empty(), "实况图集没有可用短片");
+    ensure!(
+        clips.len() <= MAX_LIVE_ALBUM_CLIPS,
+        "实况图集超过 {MAX_LIVE_ALBUM_CLIPS} 段合并上限"
+    );
+    let ffmpeg = &config.output.ffmpeg_command;
+    ensure!(!ffmpeg.trim().is_empty(), "实况图集需要 FFmpeg 和 ffprobe");
+    let ffprobe = ffprobe_for(ffmpeg);
+    let max_temp_bytes = config.resources.max_temp_bytes;
+    let max_bytes = max_video_bytes(config)
+        .min(MAX_LIVE_ALBUM_BYTES)
+        .min(max_temp_bytes);
+    let directory = std::path::absolute(&config.output.temp_dir)?;
+    std::fs::create_dir_all(&directory)?;
+    let workspace = if clips.len() > 1 {
+        Some(
+            tempfile::Builder::new()
+                .prefix("live-album-")
+                .tempdir_in(&directory)?,
+        )
+    } else {
+        None
+    };
+    let input_directory = workspace
+        .as_ref()
+        .map_or(directory.as_path(), |dir| dir.path());
+    let proxies = [config.api.proxy.clone(), config.ytdlp.proxy.clone()];
+    let mut inputs = Vec::with_capacity(clips.len());
+    let mut input_bytes = 0;
+    let mut total_duration = 0.0;
+    let mut stream_layout = None;
+    for (index, clip) in clips.iter().enumerate() {
+        let url = Url::parse(&clip.video).context("实况短片链接格式错误")?;
+        ensure!(
+            matches!(url.scheme(), "http" | "https")
+                && url.username().is_empty()
+                && url.password().is_none(),
+            "实况短片需要 HTTP(S) 播放地址"
+        );
+        let remaining_bytes = max_bytes - input_bytes;
+        ensure!(remaining_bytes > 0, "实况短片下载总量超过上限");
+        let input = tokio::time::timeout_at(
+            deadline,
+            download_media_temp(
+                url.as_str(),
+                &proxies,
+                &data.media_headers,
+                input_directory,
+                remaining_bytes,
+                max_temp_bytes,
+                remaining_time(deadline)?,
+                None,
+            ),
+        )
+        .await
+        .context("实况短片下载超过总时限")?
+        .with_context(|| format!("第 {} 段实况下载失败", index + 1))?;
+        input_bytes += input.size();
+        let info = inspect_clip(&ffprobe, input.path(), deadline)
+            .await
+            .with_context(|| format!("第 {} 段实况校验失败", index + 1))?;
+        if clips.len() == 1 {
+            return Ok(input);
+        }
+        if let Some(expected) = &stream_layout {
+            ensure!(
+                expected == &info.streams,
+                "实况短片编码参数不同，无法无损合并"
+            );
+        } else {
+            stream_layout = Some(info.streams);
+        }
+        total_duration += info.duration;
+        inputs.push(input);
+    }
+
+    let mut manifest = TempMedia::reserve(input_directory, CONCAT_MANIFEST_BYTES, max_temp_bytes)?;
+    let mut entries = String::from("ffconcat version 1.0\n");
+    for input in &inputs {
+        let filename = input
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("临时片段文件名无效")?;
+        entries.push_str(&format!("file '{filename}'\n"));
+    }
+    std::fs::write(manifest.path(), entries)?;
+    manifest.finish()?;
+    let output_limit = max_bytes.min(max_temp_bytes.saturating_sub(input_bytes + manifest.size()));
+    let mut output = TempMedia::reserve(&directory, output_limit, max_temp_bytes)?;
+    let args = vec![
+        "-nostdin".into(),
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-y".into(),
+        "-max_alloc".into(),
+        "16777216".into(),
+        "-protocol_whitelist".into(),
+        "file".into(),
+        "-f".into(),
+        "concat".into(),
+        "-safe".into(),
+        "1".into(),
+        "-i".into(),
+        manifest.path().to_string_lossy().into_owned(),
+        "-map".into(),
+        "0".into(),
+        "-c".into(),
+        "copy".into(),
+        "-fs".into(),
+        output_limit.to_string(),
+        "-movflags".into(),
+        "+faststart".into(),
+        "-f".into(),
+        "mp4".into(),
+        output.path().to_string_lossy().into_owned(),
+    ];
+    spawn_capture(ffmpeg, &args, remaining_time(deadline)?)
+        .await
+        .context("FFmpeg 实况图集无损合并失败")?;
+    output.finish()?;
+    let merged = inspect_clip(&ffprobe, output.path(), deadline)
+        .await
+        .context("合并输出校验失败")?;
+    ensure!(
+        merged.streams.len() == stream_layout.as_ref().context("实况短片缺少流参数")?.len()
+            && (merged.duration - total_duration).abs() <= (clips.len() as f64 * 0.12).max(0.5),
+        "实况合并结果音轨或时长异常"
+    );
+    Ok(output)
 }

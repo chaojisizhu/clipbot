@@ -26,20 +26,20 @@ WORKDIR /ffmpeg
 RUN curl --fail --location https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz -o source.tar.xz \
     && echo '8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e  source.tar.xz' | sha256sum -c - \
     && tar -xJf source.tar.xz --strip-components=1 \
-    && ./configure --disable-everything --disable-autodetect --disable-programs --enable-ffmpeg \
+    && ./configure --disable-everything --disable-autodetect --disable-programs --enable-ffmpeg --enable-ffprobe \
        --disable-doc --disable-debug --disable-x86asm --disable-shared --enable-static \
        --disable-avdevice --disable-swscale --disable-swresample \
        --enable-network --enable-openssl --enable-pthreads \
        --enable-protocol=file,http,https,tcp,tls,crypto \
-       --enable-demuxer=mov,mpegts,hls,matroska,aac \
+       --enable-demuxer=mov,mpegts,hls,matroska,aac,concat \
        --enable-muxer=mp4 --enable-parser=aac,h264,hevc \
        --enable-decoder=aac,h264,hevc \
        --enable-bsf=aac_adtstoasc,h264_mp4toannexb,extract_extradata \
-    && make -j2 ffmpeg \
-    && strip ffmpeg \
+    && make -j2 ffmpeg ffprobe \
+    && strip ffmpeg ffprobe \
     && mkdir -p /media-root/usr/local/bin \
-    && cp ffmpeg /media-root/usr/local/bin/ \
-    && ldd ffmpeg | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' \
+    && cp ffmpeg ffprobe /media-root/usr/local/bin/ \
+    && ldd ffmpeg ffprobe | awk '{for(i=1;i<=NF;i++) if($i ~ /^\//) print $i}' | sort -u \
        | xargs -I '{}' cp --parents '{}' /media-root
 
 FROM scratch AS runtime

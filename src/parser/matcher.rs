@@ -19,7 +19,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ),
         (
             "douyin",
-            r"(?:https?://)?(?:(?:www\.)?v\.douyin\.com/([a-zA-Z0-9_-]+)|(?:www\.)?iesdouyin\.com/share/video/(\d+)|(?:www\.)?douyin\.com/(?:video|note)/(\d+))",
+            r"(?:https?://)?(?:(?:www\.)?v\.douyin\.com/([a-zA-Z0-9_-]+)|(?:www\.)?iesdouyin\.com/share/(?:video|note|slides)/(\d+)|(?:www\.)?douyin\.com/(?:video|note|slides)/(\d+))",
         ),
         (
             "kuaishou",
@@ -210,6 +210,18 @@ pub fn clean_url(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_douyin_slides_share_links() {
+        let links =
+            link_type_parser("实况 https://www.iesdouyin.com/share/slides/7707979871255619449/");
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].media_type, "douyin");
+        assert_eq!(
+            links[0].url,
+            "https://www.iesdouyin.com/share/slides/7707979871255619449"
+        );
+    }
 
     #[test]
     fn extracts_supported_platforms() {
