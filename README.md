@@ -1,118 +1,200 @@
 # AllVideo
 
-Rust 编写的 QQ 官方视频解析机器人，使用平台原站接口和分享页面提取媒体。微信视频号沿用元宝分享解析与本地 ISAAC64 解密。项目基于工作目录内 `videorust` 的 MIT 接入模块重构，保留 QQ API v2、消息模板及可选附属功能。
+使用 Rust 编写的 QQ 官方机器人，可从分享链接解析视频、图片和实况图集，并将媒体回复到群聊或私聊。
 
-## 快速运行
+核心解析直接访问平台原站接口或分享页面。微信视频号通过元宝分享解析取得播放信息，再在本地下载、解密。抖音普通图集与实况图集支持基于已有登录态的原生 Web 请求签名。
+
+[下载发布包](https://github.com/chaojisizhu/allvideo/releases/latest) · [配置示例](config.example.yaml)
+
+## 功能
+
+- 接入 QQ 官方 API v2，支持分享链接自动解析、命令触发、消息去重和媒体上传。
+- 视频流式下载，支持 MP4、HLS 和 H.264/AAC DASH 音视频合流。
+- 普通图集以一条 Markdown 消息发送，按图片实际宽高和 EXIF 方向等比显示。
+- 抖音实况图集按原顺序下载短片，合成为一个 MP4；支持有界的异尺寸片段转换。
+- B站 App 扫码登录并保存 Cookie，支持普通视频、分P和番剧适配。
+- 按平台控制请求节奏，复用连接与会话，提供缓存、限流冷却和临时文件预算。
+- 可选启用本机 yt-dlp、JMComic 和 OpenAI 图片溯源功能。
+
+## 快速开始
+
+QQ 消息收发需要在 [QQ 开放平台](https://q.qq.com/) 创建机器人，取得 AppID、AppSecret，并配置对应消息事件及使用权限。
+
+### Linux 发布包
+
+从 Releases 下载 `allvideo-v0.2.9-linux-x86_64.tar.gz`，解压后进入程序目录。发布包包含 `videorust`、裁剪版 FFmpeg 和 ffprobe，目标环境为 Ubuntu 22.04+ / Debian 12+ 的 x86_64 系统。运行环境需有 CA 证书、libgcc 和 OpenSSL 3。
+
+```bash
+cp config.example.yaml config.linux.yaml
+chmod +x videorust ffmpeg ffprobe start.sh
+```
+
+编辑 `config.linux.yaml`，填写 `qqbot.appId`、`qqbot.appSecret`，再启动。
+
+```bash
+./start.sh check
+./start.sh bot
+```
+
+启动脚本固定读取同目录的 `config.linux.yaml`。使用源码或直接调用二进制时，可通过 `--config` 指定其他配置文件。
+
+### Windows 发布包
+
+下载 `allvideo-v0.2.9-windows-x86_64.zip`，解压后在程序目录打开 PowerShell。
 
 ```powershell
 Copy-Item config.example.yaml config.yaml
-New-Item -ItemType Directory -Force cookies
-cargo build --release --locked
-.\target\release\videorust.exe check
-.\target\release\videorust.exe parse "https://www.bilibili.com/video/BV17x411w7KC?p=2"
-.\target\release\videorust.exe probe "https://www.douyin.com/video/7611489793444171048"
 ```
 
-`parse` 输出逐行 JSON。`probe` 会完整下载并清理视频，图集输出解析得到的图片数量，可用于 QQ 登录前的独立测试。HLS 与 DASH 合流需要本机 `ffmpeg`，以 `-c copy` 直接封装。默认使用两个 Tokio 工作线程。
-
-在 `config.yaml` 填写 `qqbot.appId`、`qqbot.appSecret` 后运行 `videorust bot`。也可使用 `QQBOT_APP_ID`、`QQBOT_APP_SECRET` 环境变量。QQ 网关连接是部署验证的最后一步。
-
-## Docker
+编辑 `config.yaml` 中的 QQ 凭据，再运行。
 
 ```powershell
+.\videorust.exe check
+.\videorust.exe bot
+```
+
+Windows 发布包中的主程序可独立启动。HLS/DASH 合流和实况视频合并需要另行安装 FFmpeg、ffprobe，并将它们加入 `PATH`。也可通过 `output.ffmpegCommand` 指定 FFmpeg 路径，程序会优先查找同目录的 ffprobe。
+
+## Docker 部署
+
+在仓库根目录准备配置和 Cookie 目录。
+
+```bash
+cp config.example.yaml config.yaml
+mkdir -p cookies
+```
+
+编辑配置后执行。
+
+```bash
 docker compose build
 docker compose run --rm allvideo check
-docker compose run --rm allvideo probe "https://www.douyin.com/video/7611489793444171048"
 docker compose up -d
 docker compose logs --tail 100 -f
 ```
 
-Compose 默认使用 `media` 构建目标，包含 Rust 主程序与按需合流所用的裁剪版 FFmpeg。配置和 Cookie 按只读方式挂载，媒体目录使用独立数据卷。默认资源上限为 0.5 CPU、256 MiB 内存、64 个进程，日志最多保留 10 MiB。
+Compose 默认构建 `media` 镜像，以非 root 用户运行，配置及 Cookie 目录按只读方式挂载，临时媒体使用独立数据卷。默认限制为 0.5 CPU、256 MiB 内存和 64 个进程或线程。
 
-Dockerfile 提供三个运行目标。
-
-| 目标 | 包含内容 |
+| 构建目标 | 内容 |
 | --- | --- |
-| `runtime` | Rust 二进制、TLS 证书和所需动态库 |
-| `media` | `runtime` 与用于 HTTP/HLS/DASH 封装的 FFmpeg |
-| `extras` | 完整 Python 环境、yt-dlp 和 JMComic，支持附属下载功能 |
+| `runtime` | Rust 主程序、证书和运行库 |
+| `media` | `runtime`、FFmpeg 和 ffprobe |
+| `extras` | `media`、Python、yt-dlp 和 JMComic |
+| `test` | 编译并执行默认测试 |
 
-```powershell
-docker build --target runtime -t allvideo:rust .
-docker build --target extras -t allvideo:extras .
-docker build --target test -t allvideo:test .
+需要可选 Python 功能时，可将 Compose 的构建目标改为 `extras`。B站扫码会写入 Cookie 文件，使用 Docker 登录时需为该次运行提供可写的 Cookie 挂载，随后重启机器人加载。
+
+## 配置与登录态
+
+完整字段见 `config.example.yaml`，修改配置后重启进程。
+
+| 配置项 | 用途 |
+| --- | --- |
+| `qqbot.appId`、`qqbot.appSecret` | QQ 官方机器人凭据 |
+| `qqbot.autoParse`、`qqbot.commandPrefix` | 自动解析和手动命令 |
+| `auth.cookies.<平台>` | 浏览器完整 Cookie 请求头 |
+| `auth.cookieFiles.<平台>` | Netscape 格式 Cookie 文件 |
+| `channels.yuanbaoCookie` | 微信视频号所需的元宝登录态 |
+| `platformEnable` | 平台启停开关 |
+| `api.proxy` | 网络请求失败时使用的代理 |
+| `output.maxMarkdownImages` | 单条图集显示上限，默认 30 张 |
+| `output.ffmpegCommand` | FFmpeg 命令或可执行文件路径 |
+| `resources.maxTempBytes` | 活跃临时媒体的磁盘预算 |
+
+QQ 与元宝凭据也可通过 `QQBOT_APP_ID`、`QQBOT_APP_SECRET`、`YUANBAO_COOKIE` 环境变量传入。代理可通过 `ALLVIDEO_PROXY` 设置。
+
+### B站扫码登录
+
+```bash
+./start.sh login bilibili
 ```
 
-构建时若网络需要本机 Clash，可增加 `--build-arg HTTP_PROXY=http://host.docker.internal:7890 --build-arg HTTPS_PROXY=http://host.docker.internal:7890`。运行时代理通过 `api.proxy` 或 `ALLVIDEO_PROXY` 配置，Windows 本机可填写 `http://127.0.0.1:7890`，Docker Desktop 容器可填写 `http://host.docker.internal:7890`。
+Windows 对应命令为 `videorust.exe login bilibili`。用 B站 App 扫描生成的 `cookies/bilibili-login.png` 并确认，成功后保存 `cookies/bilibili.txt`，后续启动自动加载。
 
-## 登录与平台覆盖
+可用 `--cookie-file`、`--qr-file` 和 `--timeout-seconds` 指定输出位置与等待时间。Cookie 保存后会检查原站登录状态，访问验证及权限要求仍由原站决定。
 
-B站可通过原站二维码登录并保存 Cookie。
+### 其他平台
 
-```powershell
-.\target\release\videorust.exe login bilibili
+- **抖音**：部分公开内容可直接解析。需要登录的图集或实况内容使用 `auth.cookies.douyin`，Web 详情签名从该会话读取 UIFID。使用 Cookie 文件时，需保留 `douyin.com`、`iesdouyin.com` 各自正确的域范围。
+- **小红书**：在 `auth.cookies.xiaohongshu` 配置登录态，分享链接应保留 `xsec_token`。
+- **X / Twitter**：登录态使用 `auth.cookieFiles.twitter` 指向的 Netscape 文件，并启用 `ytdlp.enabled`；认证提取使用本机 yt-dlp。
+- **微信视频号**：使用 `channels.yuanbaoCookie`。元宝登录过期时需要更新 Cookie。
+
+配置文件、Cookie、环境文件、日志和构建产物已加入 Git 忽略规则。发布包使用空凭据示例配置。提交 Issue 或日志时，请移除账号凭据、Cookie、带签名的媒体地址及私人会话信息。
+
+## 平台覆盖与限制
+
+已包含 B站、抖音、小红书、快手、X、AcFun、皮皮虾、最右、微视、好看视频、虎牙、即梦、美拍、皮皮搞笑、豆包、头条与西瓜等原站适配。
+
+B站普通视频、抖音视频与图集、小红书视频、X 视频与图集等链路经过实际下载或 QQ 回复验证。部分适配仍有实现或验证缺口，原站更新、作品权限和网络出口会影响解析结果。
+
+默认关闭微博、YouTube、知乎、Instagram 和 TikTok。YouTube 动态播放器签名、PO Token 及部分平台权限内容仍有实现或验证缺口，配置开关可在 `platformEnable` 中调整。
+
+### 抖音实况合并
+
+程序按原页顺序处理取得的实况短片。同规格 H.264 视频和兼容 AAC 音轨直接复制编码流；不同视频规格在以下限制内统一画布后合并。
+
+- 每组最多 12 段，同时处理一组实况图集。
+- 异规格转换总时长不超过 60 秒，单片不超过 1080p，音轨参数须相同。
+- 单线程转换，画布长边最多 1280 像素，保持原比例并补黑边。
+- 输入、转换片和成品各项总量最多 64 MiB，同时受全局临时磁盘预算约束。
+
+取得的短片不完整时会提示页数；无法合并且有静态图时回退发送原图集。普通图集默认最多 30 张，单张素材上限为 10 MB。图片准备失败、配置截断和 QQ 拒绝发送均有提示。
+
+## 命令行工具
+
+```bash
+videorust --config config.yaml check
+videorust --config config.yaml parse '<分享链接>'
+videorust --config config.yaml probe '<分享链接>'
+videorust --help
 ```
 
-Linux 交付目录可运行 `./start.sh login bilibili`。用 B站 App 扫描生成的 `cookies/bilibili-login.png` 并在手机确认，成功后写入 `cookies/bilibili.txt`。后续启动会自动加载该文件。可用 `--cookie-file`、`--qr-file` 和 `--timeout-seconds` 指定路径与等待时间，指定 Cookie 文件路径时也可在 `auth.cookieFiles.bilibili` 配置复用。
+`check` 检查配置加载情况。`parse` 输出逐行 JSON。`probe` 完整下载普通视频，或下载并合并抖音实况短片，验证后清理临时媒体；普通静态图集输出解析到的图片数量。
 
-扫码确认后会检查原站登录状态。遇到原站 HTTP 412 或网络验证时，程序保留已取得的 Cookie 并显示校验状态。二维码过期或未确认时会返回可重试的提示。
+## 性能与资源控制
 
-Docker 登录需要可写 Cookie 目录，可使用 `docker run --rm -it --mount type=bind,source=<Cookie目录绝对路径>,target=/app/cookies allvideo:local login bilibili`。
+| 项目 | 默认值或处理方式 |
+| --- | --- |
+| Tokio 工作线程 | 2 |
+| 解析并发 / 活跃消息任务 | 3 / 4 |
+| 同平台请求间隔 | 800 ms，加 0–250 ms 抖动 |
+| 解析缓存 | 128 项、8 MiB、120 秒 |
+| 单视频 / 临时媒体总量 | 190 MiB / 512 MiB |
+| 直链下载 | 单连接流式下载、64 KiB 写缓冲 |
+| QQ 文件上传 | 遵从平台配额，每文件最多并发 2 片 |
+| 媒体处理 | 优先复制编码流，失败、超时和取消时清理临时文件 |
 
-当前默认关闭微博、YouTube、知乎、Instagram 与 TikTok，可在 `platformEnable` 查看开关。小红书使用 `auth.cookies.xiaohongshu`，完整分享链接需保留 `xsec_token`。X 登录态使用 Netscape 文件，在 `auth.cookieFiles.twitter` 配置后启用 `ytdlp.enabled`，认证提取将优先使用本机 yt-dlp。
+HTTP 401、403、412 触发平台冷却，429 遵从 `Retry-After`。同一抖音作品的短链和长链共用缓存，单个作品缺少媒体时只短暂记录该作品的失败。解析、下载或合流、QQ 上传耗时分别记录，便于定位网络与处理瓶颈。
 
+## 源码构建与验证
 
-按平台在 `auth.cookies` 填写浏览器完整 Cookie，或在 `auth.cookieFiles` 指向 Netscape 格式文件。Cookie 文件按域名、路径、HTTPS 标志和过期时间匹配。小红书分享链接需要保留 `xsec_token`。抖音移动分享域 `iesdouyin.com` 的 Cookie 需要在 Cookie 文件中对应此域配置。
+需要支持 Rust 2024 edition 的 Rust 工具链。媒体合流及实况功能需要 FFmpeg 和 ffprobe。
 
-元宝登录态填写 `channels.yuanbaoCookie`，也可通过 `YUANBAO_COOKIE` 提供。配置、Cookie、环境文件、日志及构建产物已列入 Git 忽略规则。
+```bash
+git clone https://github.com/chaojisizhu/allvideo.git
+cd allvideo
+cargo build --release --locked
+cp config.example.yaml config.yaml
+./target/release/videorust check
+```
 
-已实现的专用原生适配包括 B站普通视频与番剧、抖音、快手、小红书、微博、AcFun、知乎视频、X、皮皮虾、最右、微视、好看、虎牙、即梦、美拍、皮皮搞笑、豆包、头条与西瓜，以及部分海外平台页面数据。部分平台仍需补充专用签名、有效分享链接或登录态，逐平台实现和验证状态见 [平台记录](docs/PLATFORMS.md)。
+Windows 使用 `target\release\videorust.exe`。可选的 Python 功能需另行安装对应依赖，并在配置中启用。
 
-可选本机 `yt-dlp` 通过 `ytdlp.enabled` 开启。默认值为关闭。其进程设置解析时限、输出上限、请求间隔和重试上限。YouTube 动态签名、PO Token 和权限内容的原生全链路仍待完善。
-
-## 请求节奏与资源管理
-
-- HTTP 连接和匿名会话复用，按平台串行请求，默认间隔 800 ms 并加入 0–250 ms 抖动。
-- 相同链接并发合并，短期缓存同时受条目数、字节预算和 TTL 限制，默认最多 128 项、8 MiB、120 秒。
-- 401、403、412 触发平台冷却，429 遵从 `Retry-After`。访问验证会终止补充解析链，等待人工补充权限或完成原站验证。
-- 全局解析并发默认 3，活跃消息任务最多 4，单消息最多解析 3 个链接。消息队列满载时跳过溢出事件并限频告警，网关心跳继续运行。
-- 直链视频单连接流式下载，以 64 KiB 缓冲写盘。QQ 文件上传遵从预上传接口提供的并发数，每文件最多同时上传两片，配额缺省时串行。日志分别记录解析、下载或合流、QQ 上传耗时。视频号仅处理前 128 KiB 加密前缀。
-- 下载、合流和上传结束后通过文件所有权守卫清理临时媒体。正常失败、超时、任务取消均有清理路径。
-- 原生视频单文件默认 190 MiB，活动临时媒体默认合计 512 MiB。合流前预留输出预算，超限结果会失败并清理。
-- 图集素材每张最多 10 MB，逐张上传；OpenAI 图片溯源按配置最多 50 MiB，并发为 1。附属 JM 的限页、字节预算及流式打包单独管理。
-
-开源原站协议、会话与限流处理的参考链接收录在 [平台记录](docs/PLATFORMS.md)。测量结果和已知限制收录在 [验证记录](docs/VALIDATION.md)。
-
-## 开发验证
-
-```powershell
+```bash
 cargo fmt --all -- --check
 cargo test --locked --all-targets
-cargo clippy --all-targets -- -D warnings
-# 本机有 ffmpeg 与 ffprobe 时验证 HTTP 双轨与 HLS 合流
-cargo test --test remux_http -- --ignored
-# 本机有 Python 时验证传统 ZIP 加密互通
-cargo test python_zipfile_can_decrypt_generated_archive -- --ignored
+cargo clippy --locked --all-targets -- -D warnings
+
+# 需要本机 FFmpeg、ffprobe 及测试所用编码器
+cargo test --locked --test remux_http -- --ignored
+cargo test --locked --test remux_live_album -- --ignored
 ```
 
-MIT 许可证覆盖 Rust 项目，保留原接入代码的授权声明。Docker 中 FFmpeg 的源码版本、校验摘要及编译参数可在 Dockerfile 查阅，其源码提供于 FFmpeg 官方发布目录。[FFmpeg 源码](https://ffmpeg.org/releases/)
+开发中使用代理时，运行代理配置在 `api.proxy`；Docker 构建可通过 `HTTP_PROXY`、`HTTPS_PROXY` 构建参数传入。Docker Desktop 访问宿主机代理需使用 `host.docker.internal` 地址。
 
-生产环境的目录、服务和验证结果见 [生产部署](docs/PRODUCTION.md)。
+## 许可证与参考
 
-## 图集输出
+Rust 主项目使用 MIT 许可证，保留既有接入代码的授权声明。Linux 发布包附带的 FFmpeg 启用 libx264，使用 GPLv3，具体许可证随包提供。相关依赖遵循各自许可证。[项目许可证](LICENSE)
 
-抖音实况图集拿到短片后，按原顺序合成一条 MP4。相同参数的 H.264 视频及 AAC 音轨直接复制编码流。若视频尺寸不同，且总长不超过 60 秒、单片不超过 1080p、音轨参数相同，则以单线程转换为长边不超过 1280 像素的统一画布，按比例缩小并补黑边。机器人同时处理一个实况图集，每组最多 12 段，输入、转换片和成品均遵守临时磁盘预算，每项总量最多 64 MiB。合并需要 `ffmpeg` 与 `ffprobe`，Linux 媒体镜像自带两者。
-
-移动分享页未提供实况地址时，程序利用配置中现有的 UIFID 与登录态计算 Web 请求签名，直接读取原站作品详情。该路径是 Rust 普通 HTTP 请求。未取得详情时还支持 PC 作品页的 RSC 分段数据。登录态填写 `auth.cookies.douyin` 或域名匹配的 Cookie 文件，请求携带的登录态仅发送到对应原站域名。[签名协议参考](https://github.com/Evil0ctal/Douyin_TikTok_Download_API/blob/main/src/dtk/signing/native/websign.py)
-
-附属 FFmpeg 启用 libx264 后使用 GPLv3，交付包包含其许可证。Rust 项目沿用 MIT 许可证。[FFmpeg 源码](https://ffmpeg.org/releases/) [x264 源码](https://code.videolan.org/videolan/x264)
-
-图集会将文字与本次图片合成一条 Markdown 消息，默认最多 30 张，可通过 `output.maxMarkdownImages` 调整；0 使用默认值 30。程序读取 PNG、JPEG、GIF、WebP 的实际编码元信息及 EXIF 方向，按宽度最多 750 像素等比声明显示尺寸。图片逐个下载，单张上限为官方素材接口的 10 MB，处理过程中不解码像素或重新编码。
-
-图片通过 QQ 专用素材 API `media-images/prepare`、预签名 PUT 和 `media-images/complete` 上传，Markdown 使用返回的 `qqbot-media://image/v1/...` 引用。图片资源强校验保持开启，准备失败和配置截断会在图文中显示数量，最终拒绝会另发明确失败提示。
-
-成功发送后，仅删除本项目本批创建的素材。官方说明已发送消息保存了图片副本，删除素材不影响该消息。本项目素材所有权记录保存在媒体临时目录的 `.allvideo-markdown-materials.json` 中，重启或后续图集会继续清理到期记录。网络结果未确认的素材先保留五分钟，避免影响可能仍在处理的消息。损坏记录会阻止继续创建素材并返回提示。
-
-富媒体上传的临时 HTTP 图链与 X 原站图链在实际 Markdown 强校验中均返回过 `40034141`，因此图集使用专用素材引用。手机与 PC 的最终显示效果仍由实际 QQ 客户端决定。
-
-素材协议与尺寸格式参考官方文档和开源实现。[官方素材管理](https://bot.q.qq.com/wiki/develop/api-v2/server-inter/message/material-management.html) [官方尺寸实现](https://github.com/tencent-connect/qqbot-nodejs/blob/main/src/protocol/utils/image-size.ts) [Gensokyo 素材实现](https://github.com/Te-River/Gensokyo-NewQQ/blob/main/handlers/media_asset.go) [El Bot 转存实测](https://docs.bot.elpsy.cn/development/codex-remote.html)
+QQ 协议接入参考腾讯官方 SDK，抖音 Web 签名参考开源原生实现。FFmpeg 的版本、源码校验和构建参数记录在 Dockerfile 中。[QQ 官方 SDK](https://github.com/tencent-connect/qqbot-nodejs) · [抖音签名参考](https://github.com/Evil0ctal/Douyin_TikTok_Download_API/blob/main/src/dtk/signing/native/websign.py) · [FFmpeg 构建](Dockerfile)

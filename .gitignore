@@ -1,8 +1,15 @@
 /target/
 /dist/
+/releases/
+/release/
+/docs/
+/AGENTS.md
+/.codex/
 /config.yaml
 /config.yml
 /config.json
+/config.*.yaml
+!/config.example.yaml
 /cookies/
 /.env
 /temp_videos/
@@ -10,6 +17,10 @@
 /.tmp/
 *.log
 *.part
+*.pem
+*.key
+*.pfx
+*.p12
 
 **/__pycache__/
 *.py[cod]
