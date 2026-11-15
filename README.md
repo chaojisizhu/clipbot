@@ -101,7 +101,11 @@ MIT 许可证覆盖 Rust 项目，保留原接入代码的授权声明。Docker 
 
 ## 图集输出
 
-抖音实况图集拿到短片后，按原顺序合成一条 MP4。允许相同参数的 H.264 视频及 AAC 音轨，直接复制编码流。机器人同时处理一个实况图集，每组最多 12 段，输入合计与成品各最多 64 MiB，并遵守临时文件总预算。缺少短片或编码参数不一致时可返回静态图集。合并需要 `ffmpeg` 与 `ffprobe`，Linux 媒体镜像自带两者。
+抖音实况图集拿到短片后，按原顺序合成一条 MP4。相同参数的 H.264 视频及 AAC 音轨直接复制编码流。若视频尺寸不同，且总长不超过 60 秒、单片不超过 1080p、音轨参数相同，则以单线程转换为长边不超过 1280 像素的统一画布，按比例缩小并补黑边。机器人同时处理一个实况图集，每组最多 12 段，输入、转换片和成品均遵守临时磁盘预算，每项总量最多 64 MiB。合并需要 `ffmpeg` 与 `ffprobe`，Linux 媒体镜像自带两者。
+
+移动分享页未提供实况地址时，程序利用配置中现有的 UIFID 与登录态计算 Web 请求签名，直接读取原站作品详情。该路径是 Rust 普通 HTTP 请求。未取得详情时还支持 PC 作品页的 RSC 分段数据。登录态填写 `auth.cookies.douyin` 或域名匹配的 Cookie 文件，请求携带的登录态仅发送到对应原站域名。[签名协议参考](https://github.com/Evil0ctal/Douyin_TikTok_Download_API/blob/main/src/dtk/signing/native/websign.py)
+
+附属 FFmpeg 启用 libx264 后使用 GPLv3，交付包包含其许可证。Rust 项目沿用 MIT 许可证。[FFmpeg 源码](https://ffmpeg.org/releases/) [x264 源码](https://code.videolan.org/videolan/x264)
 
 图集会将文字与本次图片合成一条 Markdown 消息，默认最多 30 张，可通过 `output.maxMarkdownImages` 调整；0 使用默认值 30。程序读取 PNG、JPEG、GIF、WebP 的实际编码元信息及 EXIF 方向，按宽度最多 750 像素等比声明显示尺寸。图片逐个下载，单张上限为官方素材接口的 10 MB，处理过程中不解码像素或重新编码。
 

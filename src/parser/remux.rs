@@ -12,6 +12,8 @@ use crate::types::{AppConfig, ParsedData};
 
 const MAX_LIVE_ALBUM_CLIPS: usize = 12;
 const MAX_LIVE_ALBUM_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NORMALIZE_SECONDS: f64 = 60.0;
+const MAX_NORMALIZE_PIXELS: u64 = 1920 * 1080;
 const CONCAT_MANIFEST_BYTES: u64 = 4096;
 
 fn max_video_bytes(config: &AppConfig) -> u64 {
@@ -139,6 +141,161 @@ struct ClipInfo {
     duration: f64,
 }
 
+fn normalization_canvas(info: &[ClipInfo]) -> Result<(u64, u64)> {
+    let first = info.first().context("实况图集没有媒体信息")?;
+    let audio = |clip: &ClipInfo| {
+        clip.streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "audio")
+            .cloned()
+    };
+    let expected_audio = audio(first);
+    ensure!(
+        info.iter().map(|clip| clip.duration).sum::<f64>() <= MAX_NORMALIZE_SECONDS,
+        "异规格实况图集超过 60 秒转换上限"
+    );
+    let mut first_dimensions = None;
+    for clip in info {
+        ensure!(
+            audio(clip) == expected_audio,
+            "实况短片音频参数不同，无法直接合并音轨"
+        );
+        let video = clip
+            .streams
+            .iter()
+            .find(|stream| stream["codec_type"] == "video")
+            .context("实况短片缺少视频轨")?;
+        let width = video["width"].as_u64().context("实况短片宽度无效")?;
+        let height = video["height"].as_u64().context("实况短片高度无效")?;
+        ensure!(
+            width <= 1920 && height <= 1920 && width.saturating_mul(height) <= MAX_NORMALIZE_PIXELS,
+            "异规格实况短片超过 1080p 转换上限"
+        );
+        ensure!(
+            video["sample_aspect_ratio"]
+                .as_str()
+                .is_none_or(|ratio| matches!(ratio, "1:1" | "0:1")),
+            "异规格实况短片包含不支持的像素比例"
+        );
+        ensure!(
+            video
+                .get("side_data_list")
+                .and_then(Value::as_array)
+                .is_none_or(|entries| {
+                    entries
+                        .iter()
+                        .all(|entry| entry["rotation"].as_i64().unwrap_or(0) == 0)
+                })
+                && video
+                    .pointer("/tags/rotate")
+                    .and_then(Value::as_str)
+                    .is_none_or(|rotation| rotation == "0"),
+            "异规格实况短片包含旋转参数，无法统一画布"
+        );
+        first_dimensions.get_or_insert((width, height));
+    }
+    let (width, height) = first_dimensions.context("实况短片缺少尺寸")?;
+    let long_edge = width.max(height).max(1280);
+    let width = (width * 1280 / long_edge) / 2 * 2;
+    let height = (height * 1280 / long_edge) / 2 * 2;
+    ensure!(width >= 2 && height >= 2, "实况短片比例无法生成有效画布");
+    Ok((width, height))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn normalize_live_clips(
+    inputs: Vec<TempMedia>,
+    info: &[ClipInfo],
+    directory: &Path,
+    ffmpeg: &str,
+    ffprobe: &str,
+    max_bytes: u64,
+    max_temp_bytes: u64,
+    deadline: Instant,
+) -> Result<(Vec<TempMedia>, Vec<ClipInfo>)> {
+    let (width, height) = normalization_canvas(info)?;
+    let filter = format!(
+        "scale=w='min(iw,{width})':h='min(ih,{height})':force_original_aspect_ratio=decrease:force_divisible_by=2,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+    );
+    let mut converted = Vec::with_capacity(inputs.len());
+    let mut converted_info = Vec::with_capacity(inputs.len());
+    let mut converted_bytes = 0;
+    for (input, original) in inputs.into_iter().zip(info) {
+        let remaining = max_bytes.saturating_sub(converted_bytes);
+        ensure!(remaining > 0, "实况转换文件总量超过大小上限");
+        let mut output = TempMedia::reserve(directory, remaining, max_temp_bytes)?;
+        let args = vec![
+            "-nostdin".into(),
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-y".into(),
+            "-max_alloc".into(),
+            "16777216".into(),
+            "-threads".into(),
+            "1".into(),
+            "-filter_threads".into(),
+            "1".into(),
+            "-protocol_whitelist".into(),
+            "file".into(),
+            "-f".into(),
+            "mov".into(),
+            "-i".into(),
+            input.path().to_string_lossy().into_owned(),
+            "-map".into(),
+            "0:v:0".into(),
+            "-map".into(),
+            "0:a:0?".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+            "-vf".into(),
+            filter.clone(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-threads".into(),
+            "1".into(),
+            "-preset".into(),
+            "ultrafast".into(),
+            "-crf".into(),
+            "23".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-c:a".into(),
+            "copy".into(),
+            "-video_track_timescale".into(),
+            "15360".into(),
+            "-fs".into(),
+            remaining.to_string(),
+            "-movflags".into(),
+            "+faststart".into(),
+            "-f".into(),
+            "mp4".into(),
+            output.path().to_string_lossy().into_owned(),
+        ];
+        spawn_capture(ffmpeg, &args, remaining_time(deadline)?)
+            .await
+            .context("FFmpeg 实况短片规格统一失败")?;
+        output.finish()?;
+        let normalized = inspect_clip(ffprobe, output.path(), deadline).await?;
+        ensure!(
+            (normalized.duration - original.duration).abs() <= 0.15,
+            "实况短片转换后时长异常"
+        );
+        if let Some(first) = converted_info.first() {
+            let first: &ClipInfo = first;
+            ensure!(
+                first.streams == normalized.streams,
+                "实况短片转换后的流参数不一致"
+            );
+        }
+        converted_bytes += output.size();
+        converted.push(output);
+        converted_info.push(normalized);
+        drop(input);
+    }
+    Ok((converted, converted_info))
+}
+
 fn remaining_time(deadline: Instant) -> Result<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     ensure!(!remaining.is_zero(), "实况图集处理超时");
@@ -262,8 +419,7 @@ pub async fn download_live_album_temp(data: &ParsedData, config: &AppConfig) -> 
     let proxies = [config.api.proxy.clone(), config.ytdlp.proxy.clone()];
     let mut inputs = Vec::with_capacity(clips.len());
     let mut input_bytes = 0;
-    let mut total_duration = 0.0;
-    let mut stream_layout = None;
+    let mut clip_info = Vec::with_capacity(clips.len());
     for (index, clip) in clips.iter().enumerate() {
         let url = Url::parse(&clip.video).context("实况短片链接格式错误")?;
         ensure!(
@@ -297,17 +453,28 @@ pub async fn download_live_album_temp(data: &ParsedData, config: &AppConfig) -> 
         if clips.len() == 1 {
             return Ok(input);
         }
-        if let Some(expected) = &stream_layout {
-            ensure!(
-                expected == &info.streams,
-                "实况短片编码参数不同，无法无损合并"
-            );
-        } else {
-            stream_layout = Some(info.streams);
-        }
-        total_duration += info.duration;
+        clip_info.push(info);
         inputs.push(input);
     }
+
+    if clip_info
+        .iter()
+        .any(|info| info.streams != clip_info[0].streams)
+    {
+        (inputs, clip_info) = normalize_live_clips(
+            inputs,
+            &clip_info,
+            input_directory,
+            ffmpeg,
+            &ffprobe,
+            max_bytes,
+            max_temp_bytes,
+            deadline,
+        )
+        .await?;
+    }
+    let total_duration = clip_info.iter().map(|info| info.duration).sum::<f64>();
+    let input_bytes = inputs.iter().map(TempMedia::size).sum::<u64>();
 
     let mut manifest = TempMedia::reserve(input_directory, CONCAT_MANIFEST_BYTES, max_temp_bytes)?;
     let mut entries = String::from("ffconcat version 1.0\n");
@@ -359,7 +526,7 @@ pub async fn download_live_album_temp(data: &ParsedData, config: &AppConfig) -> 
         .await
         .context("合并输出校验失败")?;
     ensure!(
-        merged.streams.len() == stream_layout.as_ref().context("实况短片缺少流参数")?.len()
+        merged.streams.len() == clip_info[0].streams.len()
             && (merged.duration - total_duration).abs() <= (clips.len() as f64 * 0.12).max(0.5),
         "实况合并结果音轨或时长异常"
     );

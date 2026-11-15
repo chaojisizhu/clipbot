@@ -69,15 +69,37 @@ async fn frame_digest(path: &Path, seconds: &str) -> String {
         .into()
 }
 
+async fn frame_color(path: &Path, seconds: &str) -> [u8; 3] {
+    let bytes = tokio::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-ss", seconds, "-i"])
+        .arg(path)
+        .args([
+            "-vf",
+            "crop=iw/2:ih/2:iw/4:ih/4,scale=1:1",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(bytes.status.success());
+    bytes.stdout.try_into().unwrap()
+}
+
 #[tokio::test]
 #[ignore = "requires local ffmpeg and ffprobe with libx264, AAC and framemd5"]
-async fn concatenates_live_clips_in_order_and_cleans_up_after_incompatible_input() {
+async fn concatenates_live_clips_in_order_and_normalizes_mixed_dimensions() {
     let sources = tempfile::tempdir().unwrap();
     let red = sources.path().join("red.mp4");
     let blue = sources.path().join("blue.mp4");
     create_clip(&red, "red", "160x90").await;
     create_clip(&blue, "blue", "160x90").await;
-    create_clip(&sources.path().join("wide.mp4"), "red", "240x90").await;
+    create_clip(&sources.path().join("wide.mp4"), "blue", "240x90").await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -124,8 +146,16 @@ async fn concatenates_live_clips_in_order_and_cleans_up_after_incompatible_input
     assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
 
     data.live_photo[1].video = format!("{base}/wide.mp4");
-    let failure = download_live_album_temp(&data, &config).await.unwrap_err();
-    assert!(failure.to_string().contains("编码参数不同"));
+    let normalized = download_live_album_temp(&data, &config).await.unwrap();
+    let red_color = frame_color(normalized.path(), "0.5").await;
+    let blue_color = frame_color(normalized.path(), "1.5").await;
+    assert!(red_color[0] > 200 && red_color[1] < 40 && red_color[2] < 40);
+    assert!(blue_color[2] > 200 && blue_color[0] < 40 && blue_color[1] < 40);
+    drop(normalized);
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+
+    config.output.video_download_timeout = 1;
+    assert!(download_live_album_temp(&data, &config).await.is_err());
     assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
     server.abort();
 }

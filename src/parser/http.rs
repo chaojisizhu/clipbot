@@ -307,6 +307,27 @@ impl SiteHttp {
         ))
     }
 
+    /// Reads a selected session value from the same domain/path/expiry filtered
+    /// Cookie header that will accompany the original-site request.
+    pub(super) fn session_cookie(
+        &self,
+        raw_url: &str,
+        platform: &str,
+        names: &[&str],
+    ) -> Result<Option<String>> {
+        let url = validate_site_url(raw_url, platform)?;
+        let Some(header) = self.cookie_header(&url, platform)? else {
+            return Ok(None);
+        };
+        let header = header.to_str().context("Cookie 包含非法字符")?;
+        Ok(names.iter().find_map(|name| {
+            header.split(';').find_map(|pair| {
+                let (key, value) = pair.trim().split_once('=')?;
+                (*name == key && !value.is_empty()).then(|| value.to_owned())
+            })
+        }))
+    }
+
     async fn request(
         &self,
         method: Method,
@@ -388,6 +409,9 @@ impl SiteHttp {
             }
             let response = response.context("平台请求失败")?;
             if response.status().is_redirection() {
+                if options.headers.contains_key("x-secsdk-web-signature") {
+                    bail!("抖音签名接口返回重定向，已停止请求");
+                }
                 let location = response
                     .headers()
                     .get(LOCATION)
@@ -645,6 +669,43 @@ mod tests {
             )
             .unwrap()
             .is_none()
+        );
+    }
+
+    #[test]
+    fn signing_session_values_use_the_outgoing_cookie_scope() {
+        let mut http = SiteHttp::new(&AppConfig::default()).unwrap();
+        http.raw_cookies.insert(
+            "douyin".into(),
+            "UIFID_TEMP=temporary; UIFID=primary; s_v_web_id=verify_example".into(),
+        );
+        let names = crate::parser::douyin_sign::UIFID_COOKIES;
+        let endpoint = crate::parser::douyin_sign::DETAIL_ENDPOINT;
+        assert_eq!(
+            http.session_cookie(endpoint, "douyin", names).unwrap(),
+            Some("primary".into())
+        );
+        assert_eq!(
+            http.session_cookie(
+                "https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/",
+                "douyin",
+                names,
+            )
+            .unwrap(),
+            None
+        );
+        http.raw_cookies.clear();
+        http.file_cookies.insert("douyin".into(), parse_netscape_cookies(
+            "# Netscape HTTP Cookie File\nwww.douyin.com\tFALSE\t/aweme/\tTRUE\t0\tUIFID\tscoped\nwww.douyin.com\tFALSE\t/\tTRUE\t1\tUIFID_TEMP\texpired\n",
+        ).unwrap());
+        assert_eq!(
+            http.session_cookie(endpoint, "douyin", names).unwrap(),
+            Some("scoped".into())
+        );
+        assert_eq!(
+            http.session_cookie("https://www.douyin.com/note/123", "douyin", names)
+                .unwrap(),
+            None
         );
     }
 

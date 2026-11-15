@@ -1,6 +1,7 @@
 pub mod api;
 pub mod cardsearch;
 pub mod channels;
+mod douyin_sign;
 pub mod formatter;
 pub mod gpt_detect;
 pub mod http;

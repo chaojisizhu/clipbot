@@ -20,20 +20,23 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 cargo test --locked --all-targets
 
 FROM rust:1-slim-bookworm AS ffmpeg-build
-RUN apt-get update && apt-get install -y --no-install-recommends make pkg-config libssl-dev curl xz-utils \
+RUN apt-get update && apt-get install -y --no-install-recommends make pkg-config libssl-dev libx264-dev curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /ffmpeg
 RUN curl --fail --location https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz -o source.tar.xz \
     && echo '8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e  source.tar.xz' | sha256sum -c - \
     && tar -xJf source.tar.xz --strip-components=1 \
+    && sed -i 's/-lx264/-l:libx264.a/' /usr/lib/x86_64-linux-gnu/pkgconfig/x264.pc \
     && ./configure --disable-everything --disable-autodetect --disable-programs --enable-ffmpeg --enable-ffprobe \
+       --enable-gpl --enable-version3 --enable-libx264 --pkg-config-flags=--static \
        --disable-doc --disable-debug --disable-x86asm --disable-shared --enable-static \
-       --disable-avdevice --disable-swscale --disable-swresample \
+       --disable-avdevice --disable-swresample --enable-swscale \
        --enable-network --enable-openssl --enable-pthreads \
        --enable-protocol=file,http,https,tcp,tls,crypto \
        --enable-demuxer=mov,mpegts,hls,matroska,aac,concat \
        --enable-muxer=mp4 --enable-parser=aac,h264,hevc \
-       --enable-decoder=aac,h264,hevc \
+       --enable-decoder=aac,h264,hevc --enable-encoder=libx264 \
+       --enable-filter=scale,pad,fps,setsar,format \
        --enable-bsf=aac_adtstoasc,h264_mp4toannexb,extract_extradata \
     && make -j2 ffmpeg ffprobe \
     && strip ffmpeg ffprobe \
@@ -54,7 +57,7 @@ CMD ["bot"]
 
 FROM runtime AS media
 COPY --from=ffmpeg-build /media-root/ /
-COPY --from=ffmpeg-build /ffmpeg/COPYING.LGPLv2.1 /usr/share/licenses/ffmpeg/COPYING.LGPLv2.1
+COPY --from=ffmpeg-build /ffmpeg/COPYING.GPLv3 /usr/share/licenses/ffmpeg/COPYING.GPLv3
 
 FROM debian:bookworm-slim AS extras
 USER root
