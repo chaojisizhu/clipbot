@@ -240,6 +240,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipbot"
+version = "0.2.11"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "cookie",
+ "futures-util",
+ "hex",
+ "html-escape",
+ "imagesize",
+ "kamadak-exif",
+ "md5",
+ "once_cell",
+ "png",
+ "qrcode",
+ "rand 0.8.8",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha1",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "urlencoding",
+]
+
+[[package]]
 name = "compression-codecs"
 version = "0.4.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2071,43 +2108,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "clipbot"
-version = "0.2.10"
-dependencies = [
- "anyhow",
- "axum",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "cookie",
- "futures-util",
- "hex",
- "html-escape",
- "imagesize",
- "kamadak-exif",
- "md5",
- "once_cell",
- "png",
- "qrcode",
- "rand 0.8.8",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha1",
- "sha2",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tracing",
- "tracing-subscriber",
- "url",
- "urlencoding",
-]
 
 [[package]]
 name = "want"

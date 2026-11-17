@@ -14,7 +14,9 @@ use crate::parser::channels::parse_channels_share;
 use crate::parser::http::{SiteAccessRestricted, SiteHttp, SiteJsonUnavailable, validate_site_url};
 use crate::parser::jmcomic::download_jm_album;
 use crate::parser::matcher::clean_url;
+use crate::parser::sites_core::BilibiliMediaUnavailable;
 use crate::parser::sites_page::DouyinMediaUnavailable;
+use crate::parser::twitter::TwitterMediaUnavailable;
 use crate::parser::{sites_core, sites_extra, sites_other, sites_page, twitter};
 use crate::types::{AppConfig, ParsedData};
 
@@ -291,7 +293,9 @@ impl VideoParserService {
                 .parse_twitter_authenticated(&clean_url(url), cookie_file)
                 .await;
         }
-        let resolved = if platform != "douyin" && is_short_link(url) {
+        let resolved = if platform == "xiaohongshu" && is_short_link(url) {
+            self.http.resolve_xhs_short(url).await?
+        } else if platform != "douyin" && is_short_link(url) {
             self.http.resolve_url(url, platform).await?
         } else {
             url.to_string()
@@ -322,6 +326,11 @@ impl VideoParserService {
         if let Err(error) = &native {
             if error.is::<SiteAccessRestricted>()
                 || error.is::<DouyinMediaUnavailable>()
+                || error.is::<BilibiliMediaUnavailable>()
+                || matches!(
+                    error.downcast_ref::<TwitterMediaUnavailable>(),
+                    Some(TwitterMediaUnavailable::TextOnly)
+                )
                 || platform == "douyin"
                     && (error.is::<SiteJsonUnavailable>()
                         || sites_page::douyin_slides_id(resolved).is_some())
@@ -403,7 +412,13 @@ impl VideoParserService {
             if is_twitter_photo_fallback(&message) {
                 return twitter::parse_native(&self.http, url)
                     .await
-                    .map_err(|error| anyhow::anyhow!("X 公开图片提取失败。{error}"));
+                    .map_err(|error| {
+                        if error.is::<TwitterMediaUnavailable>() {
+                            error
+                        } else {
+                            anyhow::anyhow!("X 公开图片提取失败。{error}")
+                        }
+                    });
             }
         }
         result.map_err(|error| {

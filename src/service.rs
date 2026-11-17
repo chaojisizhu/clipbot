@@ -298,7 +298,8 @@ impl AppState {
                         elapsed_ms = started.elapsed().as_millis(),
                         "解析失败 [{}]: {message}", item.url
                     );
-                    failed_errors.push(render_parse_error(&self.config, &item.url, &message));
+                    let user_message = concise_user_parse_error(&message);
+                    failed_errors.push(render_parse_error(&self.config, &item.url, &user_message));
                 }
             }
         }
@@ -744,8 +745,7 @@ impl AppState {
                     Ok(file_info) => video_file_info = file_info,
                     Err(err) => {
                         warn!("视频中转失败: {err}");
-                        video_failed_note =
-                            "⚠️ 视频发送失败（下载/上传中转失败，请稍后再试）".into();
+                        video_failed_note = concise_video_transfer_note(&err);
                     }
                 }
             } else {
@@ -760,8 +760,7 @@ impl AppState {
                         Ok(file_info) => video_file_info = file_info,
                         Err(err) => {
                             warn!("视频中转失败: {err}");
-                            video_failed_note =
-                                "⚠️ 视频发送失败（本地上传中转失败，请稍后再试）".into();
+                            video_failed_note = concise_video_transfer_note(&err);
                         }
                     }
                 } else {
@@ -798,9 +797,7 @@ impl AppState {
                                         Ok(file_info) => video_file_info = file_info,
                                         Err(err) => {
                                             warn!("视频中转失败: {err}");
-                                            video_failed_note =
-                                                "⚠️ 视频发送失败（平台转存与本地上传均失败，请稍后再试）"
-                                                    .into();
+                                            video_failed_note = concise_video_transfer_note(&err);
                                         }
                                     }
                                 }
@@ -1102,6 +1099,93 @@ fn file_info_from_upload(upload: Value) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("上传响应缺少 file_info"))
 }
 
+fn concise_user_parse_error(message: &str) -> String {
+    let base = message
+        .split("；本地 yt-dlp 解析失败")
+        .next()
+        .unwrap_or(message)
+        .trim();
+    if base.contains("纯文字") {
+        return "该帖子为纯文字内容，不包含视频或图片".into();
+    }
+    if base.contains("B站原站返回 -404")
+        || base.contains("视频不存在或已被删除")
+        || message.contains("This video may be deleted")
+    {
+        return "该视频不存在或已被删除".into();
+    }
+    if base.contains("试看") || base.contains("-10403") || base.contains("地区或版权限制")
+    {
+        return "该作品为试看或受地区/权限限制，暂无法提取".into();
+    }
+    if base.contains("冷却")
+        || base.contains("风控")
+        || base.contains("HTTP 429")
+        || base.contains("HTTP 412")
+        || base.contains("-352")
+    {
+        return "平台暂时限流或触发访问验证，请稍后再试".into();
+    }
+    if base.contains("X 未返回公开媒体") || base.contains("X 公开图片提取失败") {
+        return "该 X 帖子已删除、设私或受年龄/登录限制".into();
+    }
+    if base.contains("抖音分享页未提供可下载的作品媒体")
+        || base.contains("抖音未返回此图集的媒体详情")
+        || base.contains("原站过滤码")
+    {
+        return "该抖音作品暂不可访问（可能已删除、设为私密或需登录）".into();
+    }
+    if base.contains("小红书未提供可访问的笔记媒体") || base.contains("小红书需要登录态")
+    {
+        return "该小红书笔记暂无法访问（可能已删除、链接失效或需要登录）".into();
+    }
+    if base.contains("元宝")
+        && (base.contains("401") || base.contains("20002") || base.contains("登录"))
+    {
+        return "微信视频号解析登录态已失效，请联系管理员更新".into();
+    }
+    if base.contains("缺少BV、av、ep或ss标识") {
+        return "该链接不是可解析的 B站视频地址".into();
+    }
+    if base.contains("Cookie") || base.contains("登录") {
+        return "该作品需要登录态或访问权限，暂无法提取".into();
+    }
+    if base.is_empty() {
+        "未知错误".into()
+    } else {
+        base.chars().take(80).collect()
+    }
+}
+
+fn concise_video_transfer_note(error: &anyhow::Error) -> String {
+    let text = format!("{error:#}");
+    if text.contains("群文件超过上限") {
+        return "⚠️ 视频文件过大，超出当前 QQ 群文件上限，无法发送。".into();
+    }
+    if text.contains("超过大小上限")
+        || text.contains("超过预留的文件大小上限")
+        || text.contains("临时媒体总量已达到磁盘预算")
+    {
+        return "⚠️ 视频超过大小上限，无法发送。".into();
+    }
+    if text.contains("富媒体文件上传超时")
+        || (text.contains("QQ 上传失败") && (text.contains("超时") || text.contains("timed out")))
+    {
+        return "⚠️ 视频上传 QQ 超时，请稍后重试。".into();
+    }
+    if text.contains("QQ 上传失败") {
+        return "⚠️ QQ 暂无法接收该视频，请稍后再试。".into();
+    }
+    if text.contains("视频下载超时")
+        || text.contains("执行超时")
+        || text.contains("timed out")
+        || text.contains("停滞超时")
+    {
+        return "⚠️ 视频下载超时（文件较大或原站拉取较慢），请稍后再试。".into();
+    }
+    "⚠️ 视频下载或处理失败，请稍后再试。".into()
+}
+
 fn render_parse_error(config: &AppConfig, url: &str, message: &str) -> String {
     config
         .ui_text
@@ -1187,5 +1271,43 @@ mod tests {
                 .is_none()
         );
         assert!(state.dedup_cache.lock().unwrap().len() <= 2);
+    }
+
+    #[test]
+    fn maps_non_bug_failures_to_concise_group_notices() {
+        assert_eq!(
+            concise_user_parse_error("该 X 帖子为纯文字内容，不包含视频或图片"),
+            "该帖子为纯文字内容，不包含视频或图片"
+        );
+        assert_eq!(
+            concise_user_parse_error(
+                "B站原站返回 -404，视频不存在或已被删除；本地 yt-dlp 解析失败 ERROR: deleted"
+            ),
+            "该视频不存在或已被删除"
+        );
+        assert_eq!(
+            concise_user_parse_error(
+                "X 公开图片提取失败。X 未返回公开媒体（原帖可能已删除、设私或受年龄/登录限制）"
+            ),
+            "该 X 帖子已删除、设私或受年龄/登录限制"
+        );
+        assert_eq!(
+            concise_video_transfer_note(&anyhow::anyhow!(
+                "QQ 上传失败（478 ms，下载 212532 ms）: 群文件超过上限"
+            )),
+            "⚠️ 视频文件过大，超出当前 QQ 群文件上限，无法发送。"
+        );
+        assert_eq!(
+            concise_video_transfer_note(&anyhow::anyhow!(
+                "QQ 上传失败（11197 ms，下载 76583 ms）: 富媒体文件上传超时"
+            )),
+            "⚠️ 视频上传 QQ 超时，请稍后重试。"
+        );
+        assert_eq!(
+            concise_video_transfer_note(&anyhow::anyhow!(
+                "下载或合流失败（300014 ms）: 媒体下载失败: 视频下载超时（超过 300 秒）"
+            )),
+            "⚠️ 视频下载超时（文件较大或原站拉取较慢），请稍后再试。"
+        );
     }
 }

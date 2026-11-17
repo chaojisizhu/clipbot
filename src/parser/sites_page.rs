@@ -567,25 +567,88 @@ fn read_js_value(raw: &str) -> Option<Value> {
         .trim()
         .strip_prefix("JSON.parse(")
         .unwrap_or(decoded.trim());
-    // Undefined appears in otherwise JSON-compatible SSR state. Replace only
-    // tokens outside strings so captions and signed URLs keep their original bytes.
+    // JS SSR state can include undefined, NaN/Infinity, and empty Map/Set constructors.
+    // Normalize only tokens outside strings so captions and signed URLs stay intact.
     let first_json = |text: &str| {
         serde_json::Deserializer::from_str(text)
             .into_iter::<Value>()
             .next()?
             .ok()
     };
-    let value = first_json(text).or_else(|| first_json(&normalize_undefined(text)))?;
+    let value = first_json(text).or_else(|| first_json(&normalize_js_literals(text)))?;
     match value {
         Value::String(inner) => serde_json::from_str(&inner).ok(),
         other => Some(other),
     }
 }
 
-fn normalize_undefined(text: &str) -> String {
+fn is_js_ident_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
+}
+
+fn at_ident_end(rest: &str, len: usize) -> bool {
+    !rest
+        .as_bytes()
+        .get(len)
+        .copied()
+        .is_some_and(is_js_ident_char)
+}
+
+fn match_js_constructor(rest: &str, name: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    if !rest.starts_with("new") {
+        return None;
+    }
+    let mut index = 3;
+    let ws_start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if index == ws_start || !rest[index..].starts_with(name) {
+        return None;
+    }
+    index += name.len();
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    while let Some(&byte) = bytes.get(index) {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == active {
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(index + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn normalize_js_literals(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut quoted = false;
     let mut escaped = false;
+    let mut prev_is_ident = false;
     let mut index = 0;
     while index < text.len() {
         let rest = &text[index..];
@@ -598,13 +661,38 @@ fn normalize_undefined(text: &str) -> String {
             } else if character == '"' {
                 quoted = false;
             }
-        } else if character == '"' {
-            quoted = true;
-        } else if rest.starts_with("undefined") {
-            result.push_str("null");
-            index += "undefined".len();
+            prev_is_ident = false;
+            result.push(character);
+            index += character.len_utf8();
             continue;
         }
+        if character == '"' {
+            quoted = true;
+            prev_is_ident = false;
+            result.push(character);
+            index += 1;
+            continue;
+        }
+        if !prev_is_ident {
+            let null_len = ["-Infinity", "undefined", "Infinity", "NaN"]
+                .into_iter()
+                .find(|literal| rest.starts_with(literal) && at_ident_end(rest, literal.len()))
+                .map(str::len);
+            let replacement = if let Some(len) = null_len {
+                Some(("null", len))
+            } else if let Some(len) = match_js_constructor(rest, "Map") {
+                Some(("{}", len))
+            } else {
+                match_js_constructor(rest, "Set").map(|len| ("[]", len))
+            };
+            if let Some((token, len)) = replacement {
+                result.push_str(token);
+                index += len;
+                prev_is_ident = false;
+                continue;
+            }
+        }
+        prev_is_ident = character.is_ascii() && is_js_ident_char(character as u8);
         result.push(character);
         index += character.len_utf8();
     }
@@ -1478,9 +1566,13 @@ mod tests {
 
     #[test]
     fn reads_nested_js_without_modifying_undefined_in_strings() {
-        let value = read_js_value(r#"{"a":undefined,"caption":"undefined %26 { }","b":{"url":"https://example.org/a?x=1%2B2"}};more()"#).unwrap();
+        let value = read_js_value(r#"{"a":undefined,"caption":"undefined new Map([]) %26 { }","map":new Map([]),"set":new Set(["(1)"]), "n":NaN, "inf":-Infinity,"b":{"url":"https://example.org/a?x=1%2B2"}};more()"#).unwrap();
         assert!(value["a"].is_null());
-        assert_eq!(value["caption"], "undefined %26 { }");
+        assert_eq!(value["caption"], "undefined new Map([]) %26 { }");
+        assert_eq!(value["map"], json!({}));
+        assert_eq!(value["set"], json!([]));
+        assert!(value["n"].is_null());
+        assert!(value["inf"].is_null());
         assert_eq!(value["b"]["url"], "https://example.org/a?x=1%2B2");
     }
 
@@ -1595,6 +1687,38 @@ mod tests {
                 "xiaohongshu"
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn xhs_normal_image_note_parses_when_initial_state_contains_new_map() {
+        let html = concat!(
+            "<script>window.__INITIAL_STATE__={",
+            "\"note\":{\"noteDetailMap\":{\"6af0085f000000000e035395\":{\"note\":{",
+            "\"noteId\":\"6af0085f000000000e035395\",\"type\":\"normal\",\"title\":\"图文测试\",",
+            "\"desc\":\"测试正文\",\"user\":{\"nickname\":\"作者\",\"userId\":\"u1\"},",
+            "\"imageList\":[",
+            "{\"url\":\"\",\"urlPre\":\"http://sns-webpic-qc.xhscdn.com/a.jpg\",\"urlDefault\":\"http://sns-webpic-qc.xhscdn.com/a_dft.jpg\"},",
+            "{\"url\":\"\",\"urlPre\":\"http://sns-webpic-qc.xhscdn.com/b.jpg\"}",
+            "]}}}},",
+            "\"AiNoteDetailStore\":{\"noteDetailMap\":new Map([])}",
+            "};</script>"
+        );
+        let parsed = parse_page(
+            html,
+            "https://www.xiaohongshu.com/discovery/item/6af0085f000000000e035395?xsec_token=token",
+            "xiaohongshu",
+        )
+        .unwrap();
+        assert_eq!(parsed.media_type, "image");
+        assert_eq!(parsed.title, "图文测试");
+        assert_eq!(parsed.author, "作者");
+        assert_eq!(
+            parsed.images,
+            vec![
+                "http://sns-webpic-qc.xhscdn.com/a_dft.jpg",
+                "http://sns-webpic-qc.xhscdn.com/b.jpg",
+            ]
         );
     }
 

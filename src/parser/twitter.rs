@@ -524,6 +524,43 @@ pub fn map_syndication(data: &Value) -> ParsedData {
     parsed
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TwitterMediaUnavailable {
+    TextOnly,
+    Unavailable,
+}
+
+impl std::fmt::Display for TwitterMediaUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TextOnly => formatter.write_str("该 X 帖子为纯文字内容，不包含视频或图片"),
+            Self::Unavailable => {
+                formatter.write_str("X 未返回公开媒体（原帖可能已删除、设私或受年龄/登录限制）")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TwitterMediaUnavailable {}
+
+fn classify_empty_syndication(data: &Value) -> TwitterMediaUnavailable {
+    let is_tombstone = data.get("__typename").and_then(Value::as_str) == Some("TweetTombstone")
+        || data.get("tombstone").is_some();
+    let has_tweet_content = data
+        .get("id_str")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+        || data
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty());
+    if !is_tombstone && has_tweet_content {
+        TwitterMediaUnavailable::TextOnly
+    } else {
+        TwitterMediaUnavailable::Unavailable
+    }
+}
+
 pub async fn parse_native(http: &SiteHttp, url: &str) -> anyhow::Result<ParsedData> {
     let status_id =
         extract_twitter_status_id(url).ok_or_else(|| anyhow::anyhow!("X帖子链接格式错误"))?;
@@ -532,9 +569,7 @@ pub async fn parse_native(http: &SiteHttp, url: &str) -> anyhow::Result<ParsedDa
     let data = http.get_json(&endpoint, "twitter").await?;
     let parsed = map_syndication(&data);
     if !parsed.has_media() {
-        anyhow::bail!(
-            "X未返回公开媒体，请在 auth.cookieFiles.twitter 配置 Netscape Cookie 文件并启用 ytdlp.enabled"
-        );
+        return Err(classify_empty_syndication(&data).into());
     }
     Ok(parsed)
 }
@@ -687,5 +722,32 @@ mod tests {
         assert_eq!(parsed.media_type, "video");
         assert_eq!(parsed.video, "https://video.twimg.com/high.mp4");
         assert_eq!(parsed.duration, 14);
+    }
+
+    #[test]
+    fn classifies_text_only_and_tombstone_tweets() {
+        let text_only = serde_json::json!({
+            "__typename": "Tweet",
+            "id_str": "2122240158502437045",
+            "text": "纯文字长推文",
+            "user": { "name": "Dzy" }
+        });
+        assert_eq!(
+            classify_empty_syndication(&text_only),
+            TwitterMediaUnavailable::TextOnly
+        );
+
+        let tombstone = serde_json::json!({
+            "__typename": "TweetTombstone",
+            "tombstone": { "text": { "text": "Age-restricted" } }
+        });
+        assert_eq!(
+            classify_empty_syndication(&tombstone),
+            TwitterMediaUnavailable::Unavailable
+        );
+        assert_eq!(
+            classify_empty_syndication(&serde_json::json!({})),
+            TwitterMediaUnavailable::Unavailable
+        );
     }
 }

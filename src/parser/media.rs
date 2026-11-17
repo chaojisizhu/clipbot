@@ -16,11 +16,42 @@ use crate::parser::channels::decrypt_channels_video;
 const BUFFER_LIMIT: u64 = 50 * 1024 * 1024;
 const DOWNLOAD_WRITE_BUFFER: usize = 64 * 1024;
 const ENCRYPTED_PREFIX: usize = 128 * 1024;
+const STREAM_CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_STREAM_RETRIES: usize = 3;
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 static TEMP_BYTES: AtomicU64 = AtomicU64::new(0);
 static DIRECT: Lazy<Client> = Lazy::new(|| build_client(None).expect("媒体 HTTP 客户端初始化失败"));
 static PROXY_CLIENTS: Lazy<std::sync::Mutex<HashMap<String, Client>>> =
     Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[derive(Debug)]
+struct PermanentMediaError(String);
+
+impl std::fmt::Display for PermanentMediaError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PermanentMediaError {}
+
+#[derive(Debug)]
+struct DownloadTimeoutError(String);
+
+impl std::fmt::Display for DownloadTimeoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DownloadTimeoutError {}
+
+struct TempFileTransfer {
+    // Field order matters on Windows: close the file handle before TempMedia deletes the path.
+    file: Option<tokio::fs::File>,
+    media: TempMedia,
+    can_range_resume: bool,
+}
 
 /// Owns only files created by this module. Dropping a cancelled transfer also
 /// releases its reserved disk budget and removes its partial file.
@@ -171,10 +202,73 @@ fn check_url(raw: &str) -> Result<()> {
 }
 
 fn can_try_next_media_client(error: &anyhow::Error) -> bool {
+    if error.is::<PermanentMediaError>() || error.is::<DownloadTimeoutError>() {
+        return false;
+    }
     !error
         .downcast_ref::<reqwest::Error>()
         .and_then(reqwest::Error::status)
-        .is_some_and(|status| matches!(status.as_u16(), 401 | 403 | 412 | 429))
+        .is_some_and(|status| matches!(status.as_u16(), 401 | 403 | 404 | 410 | 412 | 429))
+}
+
+fn format_error_chain(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+fn has_content_encoding(response: &reqwest::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|encoding| {
+            !encoding.trim().is_empty() && !encoding.eq_ignore_ascii_case("identity")
+        })
+}
+
+enum ParsedContentRange {
+    Complete(u64),
+    Slice {
+        start: u64,
+        end: u64,
+        total: Option<u64>,
+    },
+}
+
+struct TempDownloadParams<'a> {
+    url: &'a str,
+    headers: &'a HeaderMap,
+    directory: &'a Path,
+    max_bytes: u64,
+    max_temp_bytes: u64,
+    timeout: Duration,
+    decode_key: Option<&'a str>,
+}
+
+fn parse_content_range(header: &str) -> Option<ParsedContentRange> {
+    let (unit, spec) = header.trim().split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = spec.trim().split_once('/')?;
+    let total = if total.trim() == "*" {
+        None
+    } else {
+        Some(total.trim().parse::<u64>().ok()?)
+    };
+    if range.trim() == "*" {
+        return total.map(ParsedContentRange::Complete);
+    }
+    let (start, end) = range.trim().split_once('-')?;
+    let start = start.trim().parse::<u64>().ok()?;
+    let end = end.trim().parse::<u64>().ok()?;
+    (start <= end).then_some(ParsedContentRange::Slice { start, end, total })
+}
+
+fn is_retryable_reqwest(error: &reqwest::Error) -> bool {
+    if let Some(status) = error.status() {
+        return status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT;
+    }
+    !error.is_builder()
 }
 
 fn check_video_response(response: &reqwest::Response) -> Result<()> {
@@ -190,10 +284,13 @@ fn check_video_response(response: &reqwest::Response) -> Result<()> {
         || content_type.contains("mpegurl")
         || content_type.contains("dash+xml")
     {
-        bail!("视频返回分段播放清单，需要合流后才能发送");
+        return Err(PermanentMediaError("视频返回分段播放清单，需要合流后才能发送".into()).into());
     }
     if content_type.contains("text/html") || content_type.contains("application/json") {
-        bail!("视频下载返回网页或错误信息，请检查登录状态和播放链接");
+        return Err(PermanentMediaError(
+            "视频下载返回网页或错误信息，请检查登录状态和播放链接".into(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -204,10 +301,13 @@ fn check_video_prefix(prefix: &[u8]) -> Result<()> {
         .trim_start_matches(['\u{feff}', ' ', '\r', '\n', '\t'])
         .to_ascii_lowercase();
     if prefix.starts_with("#extm3u") || prefix.starts_with("<?xml") || prefix.starts_with("<mpd") {
-        bail!("视频返回分段播放清单，需要合流后才能发送");
+        return Err(PermanentMediaError("视频返回分段播放清单，需要合流后才能发送".into()).into());
     }
     if prefix.starts_with('<') || prefix.starts_with('{') || prefix.starts_with('[') {
-        bail!("视频内容为网页或错误信息，请检查登录状态和播放链接");
+        return Err(PermanentMediaError(
+            "视频内容为网页或错误信息，请检查登录状态和播放链接".into(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -257,27 +357,37 @@ pub async fn download_media_buffer_with_headers(
                 .content_length()
                 .is_some_and(|length| length > limit)
             {
-                bail!("媒体超过内存中转上限 {} MiB", limit / 1024 / 1024);
+                return Err(PermanentMediaError(format!(
+                    "媒体超过内存中转上限 {} MiB",
+                    limit / 1024 / 1024
+                ))
+                .into());
             }
             let mut data = Vec::new();
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(reqwest::Error::without_url)?;
                 if data.len() as u64 + chunk.len() as u64 > limit {
-                    bail!("媒体超过内存中转上限 {} MiB", limit / 1024 / 1024);
+                    return Err(PermanentMediaError(format!(
+                        "媒体超过内存中转上限 {} MiB",
+                        limit / 1024 / 1024
+                    ))
+                    .into());
                 }
                 data.extend_from_slice(&chunk);
             }
             if data.is_empty() {
-                bail!("下载内容为空");
+                return Err(PermanentMediaError("下载内容为空".into()).into());
             }
             Ok::<_, anyhow::Error>(data)
         }
         .await;
         match attempt {
             Ok(data) => return Ok(data),
-            Err(error) if can_try_next_media_client(&error) => last_error = error.to_string(),
-            Err(error) => bail!("媒体下载失败: {error}"),
+            Err(error) if can_try_next_media_client(&error) => {
+                last_error = format_error_chain(&error);
+            }
+            Err(error) => bail!("媒体下载失败: {}", format_error_chain(&error)),
         }
     }
     bail!("媒体下载失败 {last_error}")
@@ -302,6 +412,329 @@ pub async fn head_content_length(url: &str, proxies: &[String]) -> u64 {
     0
 }
 
+fn timeout_error(timeout: Duration) -> anyhow::Error {
+    DownloadTimeoutError(format!(
+        "视频下载超时（超过 {} 秒）",
+        timeout.as_secs().max(1)
+    ))
+    .into()
+}
+
+fn open_temp_transfer(directory: &Path, can_range_resume: bool) -> Result<TempFileTransfer> {
+    let path = directory.join(format!("clipbot-{:032x}.mp4", rand::random::<u128>()));
+    // Claim the pathname synchronously so a cancelled open cannot leave
+    // a file created by an unfinished Tokio filesystem worker.
+    let opened = std::fs::OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(true)
+        .open(&path)?;
+    Ok(TempFileTransfer {
+        file: Some(tokio::fs::File::from_std(opened)),
+        media: TempMedia {
+            path,
+            size: 0,
+            reserved: 0,
+        },
+        can_range_resume,
+    })
+}
+
+async fn download_media_temp_with_client(
+    client: &Client,
+    params: &TempDownloadParams<'_>,
+) -> Result<TempMedia> {
+    let deadline = tokio::time::Instant::now() + params.timeout;
+    let mut transfer: Option<TempFileTransfer> = None;
+    let mut retries_used = 0usize;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timeout_error(params.timeout));
+        }
+
+        let mut request = client
+            .get(params.url)
+            .headers(params.headers.clone())
+            .timeout(remaining);
+        if let Some(state) = transfer
+            .as_ref()
+            .filter(|state| state.media.size > 0 && state.can_range_resume)
+        {
+            request = request.header(
+                reqwest::header::RANGE,
+                format!("bytes={}-", state.media.size),
+            );
+        }
+
+        let response = match tokio::time::timeout(remaining, request.send()).await {
+            Err(_) => return Err(timeout_error(params.timeout)),
+            Ok(Err(error)) => {
+                let error = error.without_url();
+                let now = tokio::time::Instant::now();
+                if now >= deadline || (error.is_timeout() && remaining <= STREAM_CHUNK_IDLE_TIMEOUT)
+                {
+                    return Err(timeout_error(params.timeout));
+                }
+                if is_retryable_reqwest(&error) && retries_used < MAX_STREAM_RETRIES {
+                    retries_used += 1;
+                    tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
+                    continue;
+                }
+                return Err(error.into());
+            }
+            Ok(Ok(response)) => response,
+        };
+
+        let status = response.status();
+        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+            let completed = transfer.as_ref().is_some_and(|state| {
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_content_range)
+                    .is_some_and(|range| {
+                        matches!(range, ParsedContentRange::Complete(total) if total == state.media.size)
+                    })
+            });
+            if completed {
+                break;
+            }
+            return Err(PermanentMediaError("媒体断点续传范围无效（HTTP 416）".into()).into());
+        }
+        if !status.is_success() {
+            let error = response.error_for_status().unwrap_err().without_url();
+            if (status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT)
+                && retries_used < MAX_STREAM_RETRIES
+            {
+                retries_used += 1;
+                tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
+                continue;
+            }
+            return Err(error.into());
+        }
+
+        check_video_response(&response)?;
+        let encoded = has_content_encoding(&response);
+        let (expected_end, known_total) = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let offset = transfer.as_ref().map(|state| state.media.size).unwrap_or(0);
+            if offset == 0 || encoded {
+                return Err(
+                    PermanentMediaError("远端返回了意外的分片响应（HTTP 206）".into()).into(),
+                );
+            }
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_content_range)
+                .and_then(|range| match range {
+                    ParsedContentRange::Slice { start, end, total } => Some((start, end, total)),
+                    ParsedContentRange::Complete(_) => None,
+                })
+                .ok_or_else(|| {
+                    PermanentMediaError("远端分片响应缺少有效的 Content-Range".into())
+                })?;
+            let (start, end, total) = content_range;
+            if start != offset {
+                return Err(PermanentMediaError(format!(
+                    "远端分片起始偏移不匹配（期望 {offset}，实际 {start}）"
+                ))
+                .into());
+            }
+            if total.is_some_and(|size| size > params.max_bytes) {
+                return Err(PermanentMediaError(format!(
+                    "视频超过大小上限 {} MiB",
+                    params.max_bytes / 1024 / 1024
+                ))
+                .into());
+            }
+            (Some(end.saturating_add(1)), total)
+        } else {
+            if response
+                .content_length()
+                .is_some_and(|size| size > params.max_bytes)
+            {
+                return Err(PermanentMediaError(format!(
+                    "视频超过大小上限 {} MiB",
+                    params.max_bytes / 1024 / 1024
+                ))
+                .into());
+            }
+            if let Some(state) = transfer.as_mut()
+                && state.media.size > 0
+            {
+                let mut file = state.file.take().expect("transfer owns file handle");
+                file.set_len(0).await?;
+                file.seek(std::io::SeekFrom::Start(0)).await?;
+                state.file = Some(file);
+                TEMP_BYTES.fetch_sub(state.media.reserved, Ordering::Relaxed);
+                state.media.reserved = 0;
+                state.media.size = 0;
+            }
+            if let Some(state) = transfer.as_mut() {
+                state.can_range_resume = !encoded;
+            }
+            let len = (!encoded).then(|| response.content_length()).flatten();
+            (len, len)
+        };
+
+        if transfer.is_none() {
+            transfer = Some(open_temp_transfer(params.directory, !encoded)?);
+        }
+        let state = transfer.as_mut().expect("transfer initialized");
+        let before_attempt = state.media.size;
+        let mut file = state.file.take().expect("transfer owns file handle");
+        file.seek(std::io::SeekFrom::Start(state.media.size))
+            .await?;
+        let mut writer = BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, file);
+        let mut stream = response.bytes_stream();
+        let mut stream_error: Option<anyhow::Error> = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                stream_error = Some(timeout_error(params.timeout));
+                break;
+            }
+            let chunk_wait = STREAM_CHUNK_IDLE_TIMEOUT.min(remaining);
+            match tokio::time::timeout(chunk_wait, stream.next()).await {
+                Err(_) => {
+                    stream_error = Some(if tokio::time::Instant::now() >= deadline {
+                        timeout_error(params.timeout)
+                    } else {
+                        anyhow::anyhow!("媒体流读取停滞超时")
+                    });
+                    break;
+                }
+                Ok(None) => break,
+                Ok(Some(Err(error))) => {
+                    let error = error.without_url();
+                    stream_error = Some(
+                        if tokio::time::Instant::now() >= deadline
+                            || (error.is_timeout() && remaining <= STREAM_CHUNK_IDLE_TIMEOUT)
+                        {
+                            timeout_error(params.timeout)
+                        } else {
+                            error.into()
+                        },
+                    );
+                    break;
+                }
+                Ok(Some(Ok(chunk))) => {
+                    let chunk_len = chunk.len() as u64;
+                    let next_size = state.media.size.saturating_add(chunk_len);
+                    if next_size > params.max_bytes {
+                        stream_error = Some(
+                            PermanentMediaError(format!(
+                                "视频超过大小上限 {} MiB",
+                                params.max_bytes / 1024 / 1024
+                            ))
+                            .into(),
+                        );
+                        break;
+                    }
+                    if let Err(budget_error) = reserve_temp(chunk_len, params.max_temp_bytes) {
+                        stream_error = Some(PermanentMediaError(budget_error.to_string()).into());
+                        break;
+                    }
+                    state.media.size = next_size;
+                    state.media.reserved += chunk_len;
+                    writer.write_all(&chunk).await?;
+                }
+            }
+        }
+
+        writer.flush().await?;
+        state.file = Some(writer.into_inner());
+
+        if let Some(error) = stream_error {
+            if error.is::<PermanentMediaError>() || error.is::<DownloadTimeoutError>() {
+                return Err(error);
+            }
+            if retries_used < MAX_STREAM_RETRIES {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining > Duration::from_millis(500) {
+                    retries_used += 1;
+                    tracing::debug!(
+                        retries_used,
+                        offset = state.media.size,
+                        "媒体流中断，尝试断点续传: {}",
+                        format_error_chain(&error)
+                    );
+                    tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
+                    continue;
+                }
+                return Err(timeout_error(params.timeout));
+            }
+            return Err(error);
+        }
+
+        if let Some(end) = expected_end
+            && state.media.size < end
+        {
+            if retries_used < MAX_STREAM_RETRIES {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining > Duration::from_millis(500) {
+                    retries_used += 1;
+                    tracing::debug!(
+                        retries_used,
+                        offset = state.media.size,
+                        expected_end = end,
+                        "媒体响应提前结束，尝试断点续传"
+                    );
+                    tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
+                    continue;
+                }
+                return Err(timeout_error(params.timeout));
+            }
+            bail!(
+                "媒体下载不完整（预期 {end} 字节，实际 {} 字节）",
+                state.media.size
+            );
+        }
+
+        if let Some(total) = known_total
+            && state.media.size < total
+        {
+            if state.media.size > before_attempt {
+                continue;
+            }
+            bail!(
+                "媒体分片未继续推进（已完成 {} / {total} 字节）",
+                state.media.size
+            );
+        }
+        break;
+    }
+
+    let mut state = transfer.ok_or_else(|| PermanentMediaError("下载内容为空".into()))?;
+    if state.media.size == 0 {
+        return Err(PermanentMediaError("下载内容为空".into()).into());
+    }
+    let mut file = state.file.take().expect("transfer owns file handle");
+    if let Some(key) = params.decode_key {
+        let key: u64 = key
+            .parse()
+            .map_err(|_| PermanentMediaError("无效的视频号解密密钥".into()))?;
+        file.seek(std::io::SeekFrom::Start(0)).await?;
+        let mut prefix = vec![0; ENCRYPTED_PREFIX.min(state.media.size as usize)];
+        file.read_exact(&mut prefix).await?;
+        let decrypted = decrypt_channels_video(&prefix, key);
+        file.seek(std::io::SeekFrom::Start(0)).await?;
+        file.write_all(&decrypted).await?;
+    }
+    file.seek(std::io::SeekFrom::Start(0)).await?;
+    let mut prefix = vec![0u8; 512.min(state.media.size as usize)];
+    file.read_exact(&mut prefix).await?;
+    check_video_prefix(&prefix)?;
+    file.flush().await?;
+    drop(file);
+    Ok(state.media)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn download_media_temp(
     url: &str,
@@ -316,79 +749,23 @@ pub async fn download_media_temp(
     check_url(url)?;
     tokio::fs::create_dir_all(directory).await?;
     let headers = safe_headers(headers);
+    let params = TempDownloadParams {
+        url,
+        headers: &headers,
+        directory,
+        max_bytes,
+        max_temp_bytes,
+        timeout,
+        decode_key,
+    };
     let mut last_error = String::new();
     for client in clients(url, proxies) {
-        let attempt = async {
-            let response = client
-                .get(url)
-                .headers(headers.clone())
-                .timeout(timeout)
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status)
-                .map_err(reqwest::Error::without_url)?;
-            check_video_response(&response)?;
-            if response
-                .content_length()
-                .is_some_and(|size| size > max_bytes)
-            {
-                bail!("视频超过大小上限 {} MiB", max_bytes / 1024 / 1024);
-            }
-            let path = directory.join(format!("clipbot-{:032x}.mp4", rand::random::<u128>()));
-            // Claim the pathname synchronously so a cancelled open cannot leave
-            // a file created by an unfinished Tokio filesystem worker.
-            let opened = std::fs::OpenOptions::new()
-                .write(true)
-                .read(true)
-                .create_new(true)
-                .open(&path)?;
-            let mut temporary = TempMedia {
-                path,
-                size: 0,
-                reserved: 0,
-            };
-            // The file is dropped before its guard on cancellation, including on Windows.
-            let mut writer =
-                BufWriter::with_capacity(DOWNLOAD_WRITE_BUFFER, tokio::fs::File::from_std(opened));
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(reqwest::Error::without_url)?;
-                let next_size = temporary.size.saturating_add(chunk.len() as u64);
-                if next_size > max_bytes {
-                    bail!("视频超过大小上限 {} MiB", max_bytes / 1024 / 1024);
-                }
-                reserve_temp(chunk.len() as u64, max_temp_bytes)?;
-                temporary.size = next_size;
-                temporary.reserved += chunk.len() as u64;
-                writer.write_all(&chunk).await?;
-            }
-            if temporary.size == 0 {
-                bail!("下载内容为空");
-            }
-            writer.flush().await?;
-            let mut file = writer.into_inner();
-            if let Some(key) = decode_key {
-                let key: u64 = key.parse().context("无效的视频号解密密钥")?;
-                file.seek(std::io::SeekFrom::Start(0)).await?;
-                let mut prefix = vec![0; ENCRYPTED_PREFIX.min(temporary.size as usize)];
-                file.read_exact(&mut prefix).await?;
-                let decrypted = decrypt_channels_video(&prefix, key);
-                file.seek(std::io::SeekFrom::Start(0)).await?;
-                file.write_all(&decrypted).await?;
-            }
-            file.seek(std::io::SeekFrom::Start(0)).await?;
-            let mut prefix = vec![0u8; 512.min(temporary.size as usize)];
-            file.read_exact(&mut prefix).await?;
-            check_video_prefix(&prefix)?;
-            file.flush().await?;
-            drop(file);
-            Ok::<_, anyhow::Error>(temporary)
-        }
-        .await;
-        match attempt {
+        match download_media_temp_with_client(&client, &params).await {
             Ok(temporary) => return Ok(temporary),
-            Err(error) if can_try_next_media_client(&error) => last_error = error.to_string(),
-            Err(error) => bail!("媒体下载失败: {error}"),
+            Err(error) if can_try_next_media_client(&error) => {
+                last_error = format_error_chain(&error);
+            }
+            Err(error) => bail!("媒体下载失败: {}", format_error_chain(&error)),
         }
     }
     bail!("媒体下载失败 {last_error}")
@@ -639,6 +1016,109 @@ mod tests {
         })
         .await
         .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn resumes_truncated_stream_with_range_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/video.mp4", listener.local_addr().unwrap());
+        let expected: Vec<u8> = (0..8192).map(|index| (index % 251) as u8).collect();
+        let full = expected.clone();
+        let app = axum::Router::new().route(
+            "/video.mp4",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let full = full.clone();
+                async move {
+                    if let Some(range) = headers.get(axum::http::header::RANGE)
+                        && range.to_str().ok() == Some("bytes=4096-")
+                    {
+                        let part = full[4096..].to_vec();
+                        return axum::response::Response::builder()
+                            .status(axum::http::StatusCode::PARTIAL_CONTENT)
+                            .header(axum::http::header::CONTENT_RANGE, "bytes 4096-8191/8192")
+                            .header(axum::http::header::CONTENT_LENGTH, part.len().to_string())
+                            .body(axum::body::Body::from(part))
+                            .unwrap();
+                    }
+                    let total_len = full.len();
+                    let first = futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&full[..4096]))
+                    })
+                    .chain(futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "simulated disconnect",
+                        ))
+                    }));
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::OK)
+                        .header(axum::http::header::CONTENT_LENGTH, total_len.to_string())
+                        .body(axum::body::Body::from_stream(first))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = download_media_temp(
+            &url,
+            &[],
+            &HashMap::new(),
+            directory.path(),
+            16384,
+            65536,
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(temporary.size(), 8192);
+        assert_eq!(tokio::fs::read(temporary.path()).await.unwrap(), expected);
+        let path = temporary.path().to_owned();
+        drop(temporary);
+        assert!(!path.exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn timeout_reports_clear_reason_and_cleans_partial_file() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/slow.mp4", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/slow.mp4",
+            axum::routing::get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(vec![7; 1024]))
+                });
+                axum::body::Body::from_stream(first.chain(futures_util::stream::pending()))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let error = download_media_temp(
+            &url,
+            &[],
+            &HashMap::new(),
+            directory.path(),
+            16384,
+            65536,
+            Duration::from_millis(250),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("超时"),
+            "expected clear timeout error, got: {message}"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         server.abort();
     }
 }

@@ -129,6 +129,16 @@ pub fn domain_matches(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+fn is_xiaohongshu_restricted_redirect(platform: &str, next: &Url) -> bool {
+    let Some(host) = next.host_str() else {
+        return false;
+    };
+    platform == "xiaohongshu"
+        && (domain_matches(host, "rednote.com")
+            || (domain_matches(host, "xiaohongshu.com")
+                && (next.path().starts_with("/login") || next.path().starts_with("/web-login"))))
+}
+
 pub fn validate_site_url(raw: &str, platform: &str) -> Result<Url> {
     let mut url = Url::parse(raw).context("链接格式错误")?;
     let host = url.host_str().unwrap_or_default();
@@ -418,6 +428,13 @@ impl SiteHttp {
                     .context("重定向缺少 Location")?
                     .to_str()?;
                 let next = url.join(location)?;
+                if is_xiaohongshu_restricted_redirect(platform, &next) {
+                    return Err(SiteAccessRestricted(
+                        "小红书需要登录态或触发海外跳转验证，请更新 auth.cookies.xiaohongshu"
+                            .into(),
+                    )
+                    .into());
+                }
                 url = validate_site_url(next.as_str(), platform)?;
                 if options.stop_at.is_some_and(|predicate| predicate(&url)) {
                     return Ok(SiteResponse::RedirectTarget(url));
@@ -495,6 +512,27 @@ impl SiteHttp {
                 "douyin",
                 RequestOptions {
                     stop_at: Some(|url| super::sites_page::douyin_path_id(url).is_some()),
+                    ..RequestOptions::default()
+                },
+            )
+            .await?;
+        Ok(match result {
+            SiteResponse::Final(response) => response.url().to_string(),
+            SiteResponse::RedirectTarget(target) => target.into(),
+        })
+    }
+
+    pub(super) async fn resolve_xhs_short(&self, url: &str) -> Result<String> {
+        let result = self
+            .request(
+                Method::GET,
+                url,
+                "xiaohongshu",
+                RequestOptions {
+                    stop_at: Some(|url| {
+                        url.host_str()
+                            .is_some_and(|host| domain_matches(host, "xiaohongshu.com"))
+                    }),
                     ..RequestOptions::default()
                 },
             )
@@ -757,5 +795,25 @@ mod tests {
         assert!(error.is::<SiteAccessRestricted>());
         assert!(error.to_string().contains("冷却期"));
         assert!(!http.is_cooling_down("douyin").await);
+    }
+
+    #[test]
+    fn recognizes_xiaohongshu_rednote_and_login_redirects() {
+        assert!(is_xiaohongshu_restricted_redirect(
+            "xiaohongshu",
+            &Url::parse("https://www.rednote.com/discovery/item/abc").unwrap()
+        ));
+        assert!(is_xiaohongshu_restricted_redirect(
+            "xiaohongshu",
+            &Url::parse("https://www.xiaohongshu.com/login?redirectPath=/").unwrap()
+        ));
+        assert!(!is_xiaohongshu_restricted_redirect(
+            "xiaohongshu",
+            &Url::parse("https://www.xiaohongshu.com/discovery/item/abc").unwrap()
+        ));
+        assert!(!is_xiaohongshu_restricted_redirect(
+            "douyin",
+            &Url::parse("https://www.rednote.com/").unwrap()
+        ));
     }
 }

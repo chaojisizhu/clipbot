@@ -22,6 +22,17 @@ static HTML_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?s)<[^>]*>").unwrap())
 static WBI_KEY: Lazy<tokio::sync::Mutex<Option<(Instant, String)>>> =
     Lazy::new(|| tokio::sync::Mutex::new(None));
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BilibiliMediaUnavailable(pub String);
+
+impl std::fmt::Display for BilibiliMediaUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for BilibiliMediaUnavailable {}
+
 pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedData> {
     let mut parsed = match platform {
         "bilibili" => parse_bilibili(http, url).await?,
@@ -110,6 +121,14 @@ fn checked_bili_payload(response: &Value) -> Result<&Value> {
         "B站原站要求风控验证，请在浏览器完成验证并补充 bilibili Cookie"
     );
     let code = number(response, "/code");
+    if code == -404 {
+        return Err(
+            BilibiliMediaUnavailable("B站原站返回 -404，视频不存在或已被删除".into()).into(),
+        );
+    }
+    if code == -10403 {
+        return Err(BilibiliMediaUnavailable("B站原站返回 -10403，受地区或版权限制".into()).into());
+    }
     ensure!(
         code == 0,
         "B站原站返回错误 {code}，{}。需要权限时请补充 bilibili Cookie",
@@ -893,6 +912,12 @@ mod tests {
             )
             .is_err()
         );
+        let not_found =
+            checked_bili_payload(&json!({"code":-404,"message":"啥都木有"})).unwrap_err();
+        assert!(not_found.is::<BilibiliMediaUnavailable>());
+        assert!(not_found.to_string().contains("-404"));
+        let area = checked_bili_payload(&json!({"code":-10403,"message":"版权限制"})).unwrap_err();
+        assert!(area.is::<BilibiliMediaUnavailable>());
     }
 
     #[test]
