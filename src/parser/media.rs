@@ -36,7 +36,7 @@ impl std::fmt::Display for PermanentMediaError {
 impl std::error::Error for PermanentMediaError {}
 
 #[derive(Debug)]
-struct DownloadTimeoutError(String);
+pub(super) struct DownloadTimeoutError(String);
 
 impl std::fmt::Display for DownloadTimeoutError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

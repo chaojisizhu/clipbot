@@ -15,7 +15,7 @@ use crate::parser::http::{SiteAccessRestricted, SiteHttp, SiteJsonUnavailable, v
 use crate::parser::jmcomic::download_jm_album;
 use crate::parser::matcher::clean_url;
 use crate::parser::sites_core::BilibiliMediaUnavailable;
-use crate::parser::sites_page::DouyinMediaUnavailable;
+use crate::parser::sites_page::{DouyinMediaUnavailable, XhsMediaUnavailable};
 use crate::parser::twitter::TwitterMediaUnavailable;
 use crate::parser::{sites_core, sites_extra, sites_other, sites_page, twitter};
 use crate::types::{AppConfig, ParsedData};
@@ -326,6 +326,7 @@ impl VideoParserService {
         if let Err(error) = &native {
             if error.is::<SiteAccessRestricted>()
                 || error.is::<DouyinMediaUnavailable>()
+                || error.is::<XhsMediaUnavailable>()
                 || error.is::<BilibiliMediaUnavailable>()
                 || matches!(
                     error.downcast_ref::<TwitterMediaUnavailable>(),
@@ -469,6 +470,7 @@ fn is_short_link(raw: &str) -> bool {
                 | "www.v.douyin.com"
                 | "v.kuaishou.com"
                 | "xhslink.com"
+                | "xhslink.cn"
                 | "t.co"
                 | "youtu.be"
                 | "vt.tiktok.com"

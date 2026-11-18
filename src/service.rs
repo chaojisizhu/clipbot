@@ -327,7 +327,7 @@ impl AppState {
                 }
                 continue;
             }
-            let delivered = if item.media_type == "douyin"
+            let delivered = if matches!(item.media_type.as_str(), "douyin" | "xiaohongshu")
                 && parsed.media_type == "live_photo"
                 && self.config.output.show_video_file
             {
@@ -594,7 +594,7 @@ impl AppState {
         text: &str,
     ) -> bool {
         if parsed.live_photo.is_empty() {
-            self.send_message(event, text_payload("抖音只返回了静态图片，下面是原图集。"))
+            self.send_message(event, text_payload("原帖只返回了静态图片，下面是原图集。"))
                 .await;
             return self.send_gallery_result(event, parsed, text).await;
         }
@@ -619,7 +619,7 @@ impl AppState {
                 clips = parsed.live_photo.len(),
                 bytes = video.size(),
                 elapsed_ms = started.elapsed().as_millis(),
-                "抖音实况图集已合并并上传"
+                "实况图集已合并并上传"
             );
             Ok::<_, anyhow::Error>(file_info)
         }
@@ -629,7 +629,7 @@ impl AppState {
         let file_info = match file_info {
             Ok(file_info) => file_info,
             Err(error) => {
-                warn!("抖音实况图集无法合并或上传: {error}");
+                warn!("实况图集无法合并或上传: {error}");
                 self.send_message(
                     event,
                     text_payload("实况短片暂时无法合并发送，下面是原图集。"),
@@ -1135,6 +1135,10 @@ fn concise_user_parse_error(message: &str) -> String {
     {
         return "该抖音作品暂不可访问（可能已删除、设为私密或需登录）".into();
     }
+    if base.contains("小红书该笔记不存在") || base.contains("已删除或暂不可访问")
+    {
+        return "该小红书笔记已删除、失效或暂不可访问".into();
+    }
     if base.contains("小红书未提供可访问的笔记媒体") || base.contains("小红书需要登录态")
     {
         return "该小红书笔记暂无法访问（可能已删除、链接失效或需要登录）".into();
@@ -1284,6 +1288,10 @@ mod tests {
                 "B站原站返回 -404，视频不存在或已被删除；本地 yt-dlp 解析失败 ERROR: deleted"
             ),
             "该视频不存在或已被删除"
+        );
+        assert_eq!(
+            concise_user_parse_error("小红书该笔记不存在、已删除或暂不可访问"),
+            "该小红书笔记已删除、失效或暂不可访问"
         );
         assert_eq!(
             concise_user_parse_error(

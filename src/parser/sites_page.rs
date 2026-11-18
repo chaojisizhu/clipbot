@@ -48,6 +48,17 @@ impl std::fmt::Display for DouyinMediaUnavailable {
 
 impl std::error::Error for DouyinMediaUnavailable {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct XhsMediaUnavailable;
+
+impl std::fmt::Display for XhsMediaUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("小红书该笔记不存在、已删除或暂不可访问")
+    }
+}
+
+impl std::error::Error for XhsMediaUnavailable {}
+
 /// Read only data delivered by the original site's public page.
 pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedData> {
     if platform == "douyin"
@@ -335,7 +346,7 @@ fn map_douyin_feed(data: &Value, id: &str) -> Option<ParsedData> {
 }
 
 fn set_media_headers(parsed: &mut ParsedData, url: &str, platform: &str) {
-    let user_agent = if matches!(platform, "douyin" | "kuaishou") {
+    let user_agent = if matches!(platform, "douyin" | "kuaishou" | "xiaohongshu") {
         MOBILE_USER_AGENT
     } else {
         USER_AGENT
@@ -383,6 +394,9 @@ pub fn parse_page(html: &str, url: &str, platform: &str) -> Result<ParsedData> {
     }
     if platform == "douyin" {
         return Err(DouyinMediaUnavailable::Work.into());
+    }
+    if platform == "xiaohongshu" && xhs_note_unavailable(&states) {
+        return Err(XhsMediaUnavailable.into());
     }
     let message = match platform {
         "xiaohongshu" => {
@@ -1016,11 +1030,74 @@ fn map_aweme(item: &Value) -> ParsedData {
     result
 }
 
+fn xhs_note_unavailable(states: &[Value]) -> bool {
+    states.iter().any(|state| {
+        state
+            .pointer("/noteData/errorNoteData/show")
+            .and_then(Value::as_bool)
+            == Some(true)
+            || state
+                .pointer("/noteData/data")
+                .is_some_and(|data| data.as_object().is_some_and(serde_json::Map::is_empty))
+    })
+}
+
 fn xhs_note<'a>(root: &'a Value, id: &str) -> Option<&'a Value> {
-    let map = root.pointer("/note/noteDetailMap")?.as_object()?;
-    let note = map.get(id)?.get("note")?;
+    if let Some(map) = root
+        .pointer("/note/noteDetailMap")
+        .and_then(Value::as_object)
+        && let Some(note) = map.get(id).and_then(|entry| entry.get("note"))
+    {
+        let actual = text(note, &["/noteId", "/id"]);
+        if actual.is_empty() || id.is_empty() || actual == id {
+            return Some(note);
+        }
+    }
+    let note = root
+        .pointer("/noteData/data/noteData")
+        .filter(|value| value.as_object().is_some_and(|map| !map.is_empty()))?;
     let actual = text(note, &["/noteId", "/id"]);
-    (actual.is_empty() || actual == id).then_some(note)
+    (actual.is_empty() || id.is_empty() || actual == id).then_some(note)
+}
+
+fn xhs_stream_qualities(items: Option<&Value>, duration: &mut u64) -> Vec<VideoQuality> {
+    let mut qualities = Vec::new();
+    let Some(items) = items.and_then(Value::as_array) else {
+        return qualities;
+    };
+    for stream in items {
+        let url = url_at(stream, &["/masterUrl", "/backupUrls/0"]);
+        if !url.is_empty() {
+            if *duration == 0 {
+                *duration = number(stream, &["/duration"]).max(0) as u64 / 1000;
+            }
+            qualities.push(VideoQuality {
+                quality: text(stream, &["/qualityType", "/qualityDesc"]),
+                url,
+                bit_rate: Some(number(stream, &["/avgBitrate", "/videoBitrate"]).max(0) as u64),
+            });
+        }
+    }
+    qualities.sort_by_key(|quality| std::cmp::Reverse(quality.bit_rate.unwrap_or(0)));
+    qualities
+}
+
+fn xhs_live_video(image: &Value) -> Option<String> {
+    let streams = image.get("stream").and_then(Value::as_object)?;
+    for key in std::iter::once("h264")
+        .chain(std::iter::once("h265"))
+        .chain(streams.keys().map(String::as_str))
+    {
+        if let Some(items) = streams.get(key).and_then(Value::as_array) {
+            for item in items {
+                let url = url_at(item, &["/masterUrl", "/backupUrls/0"]);
+                if !url.is_empty() {
+                    return Some(url);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn map_xhs(note: &Value) -> ParsedData {
@@ -1037,46 +1114,63 @@ fn map_xhs(note: &Value) -> ParsedData {
         publish_time: number(note, &["/time"]),
         ..ParsedData::default()
     };
+    let origin_url = {
+        let origin_key = text(note, &["/video/consumer/originVideoKey"]);
+        if origin_key.is_empty() {
+            String::new()
+        } else {
+            media_url(&format!("https://sns-video-bd.xhscdn.com/{origin_key}"))
+        }
+    };
     if let Some(streams) = note
         .pointer("/video/media/stream")
         .and_then(Value::as_object)
     {
-        let preferred = streams
-            .get("h264")
-            .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()));
-        let lists: Vec<&Value> = preferred
-            .map(|value| vec![value])
-            .unwrap_or_else(|| streams.values().collect());
-        for stream in lists.iter().filter_map(|value| value.as_array()).flatten() {
-            let url = url_at(stream, &["/masterUrl", "/backupUrls/0"]);
-            if !url.is_empty() {
-                result.duration = number(stream, &["/duration"]).max(0) as u64 / 1000;
-                result.videos.push(VideoQuality {
-                    quality: text(stream, &["/qualityType", "/qualityDesc"]),
-                    url,
-                    bit_rate: Some(number(stream, &["/avgBitrate", "/videoBitrate"]).max(0) as u64),
-                });
+        // Prefer watermark-free H.265 stream or original file before watermarked H.264 share streams.
+        result.videos.extend(xhs_stream_qualities(
+            streams.get("h265"),
+            &mut result.duration,
+        ));
+        if !origin_url.is_empty() {
+            result.videos.push(VideoQuality {
+                quality: "origin".into(),
+                url: origin_url.clone(),
+                bit_rate: None,
+            });
+        }
+        result.videos.extend(xhs_stream_qualities(
+            streams.get("h264"),
+            &mut result.duration,
+        ));
+        for (key, items) in streams {
+            if key != "h265" && key != "h264" {
+                result
+                    .videos
+                    .extend(xhs_stream_qualities(Some(items), &mut result.duration));
             }
         }
+    } else if !origin_url.is_empty() {
+        result.videos.push(VideoQuality {
+            quality: "origin".into(),
+            url: origin_url.clone(),
+            bit_rate: None,
+        });
     }
-    result
-        .videos
-        .sort_by_key(|quality| std::cmp::Reverse(quality.bit_rate.unwrap_or(0)));
+    if result.duration == 0 {
+        result.duration = number(note, &["/video/media/video/duration"]).max(0) as u64;
+    }
     result.video = result
         .videos
         .first()
         .map(|quality| quality.url.clone())
-        .unwrap_or_default();
-    if result.video.is_empty() {
-        let origin_key = text(note, &["/video/consumer/originVideoKey"]);
-        if !origin_key.is_empty() {
-            result.video = media_url(&format!("https://sns-video-bd.xhscdn.com/{origin_key}"));
-        }
-    }
+        .unwrap_or(origin_url);
     let mut sizes = HashMap::new();
     if let Some(images) = note.get("imageList").and_then(Value::as_array) {
         for image in images {
-            let url = url_at(image, &["/urlDefault", "/urlPre", "/infoList/0/url"]);
+            let url = url_at(
+                image,
+                &["/urlDefault", "/urlPre", "/url", "/infoList/0/url"],
+            );
             if !url.is_empty() {
                 if result.cover.is_empty() {
                     result.cover = url.clone();
@@ -1087,6 +1181,14 @@ fn map_xhs(note: &Value) -> ParsedData {
                     if let Some(size) = image_size(image) {
                         sizes.insert(url.clone(), size);
                     }
+                    if image.get("livePhoto").and_then(Value::as_bool) == Some(true)
+                        && let Some(live_video) = xhs_live_video(image)
+                    {
+                        result.live_photo.push(LivePhoto {
+                            image: url.clone(),
+                            video: live_video,
+                        });
+                    }
                     result.images.push(url);
                 }
             }
@@ -1096,6 +1198,9 @@ fn map_xhs(note: &Value) -> ParsedData {
         result.image_size_map = Some(sizes);
     }
     set_type(&mut result);
+    if !result.live_photo.is_empty() {
+        result.media_type = "live_photo".into();
+    }
     result
 }
 
@@ -1720,6 +1825,131 @@ mod tests {
                 "http://sns-webpic-qc.xhscdn.com/b.jpg",
             ]
         );
+    }
+
+    #[test]
+    fn xhs_mobile_rednote_image_and_live_photo_note_parses() {
+        let html = script(
+            json!({"noteData":{"data":{"noteData":{
+                "noteId":"6af5042d000000002a02913e",
+                "type":"normal",
+                "title":"移动端实况图集",
+                "desc":"正文",
+                "user":{"userId":"u1","nickName":"手机作者"},
+                "video":{"media":{"stream":{}}},
+                "imageList":[
+                    {"url":"http://sns-web-i10.rednotecdn.com/pic1.jpg","livePhoto":false,"stream":{},"width":1080,"height":1440},
+                    {"url":"http://sns-web-i10.rednotecdn.com/pic2.jpg","livePhoto":true,"stream":{"h264":[{"masterUrl":"http://sns-v11.rednotecdn.com/live2.mp4"}]}}
+                ]
+            }}}}),
+            "window.__INITIAL_STATE__",
+        );
+        let parsed = parse_page(
+            &html,
+            "https://www.rednote.com/discovery/item/6af5042d000000002a02913e?app_platform=ios",
+            "xiaohongshu",
+        )
+        .unwrap();
+        assert_eq!(parsed.media_type, "live_photo");
+        assert_eq!(parsed.title, "移动端实况图集");
+        assert_eq!(parsed.author, "手机作者");
+        assert_eq!(parsed.images.len(), 2);
+        assert_eq!(parsed.live_photo.len(), 1);
+        assert_eq!(
+            parsed.live_photo[0].image,
+            "http://sns-web-i10.rednotecdn.com/pic2.jpg"
+        );
+        assert_eq!(
+            parsed.live_photo[0].video,
+            "http://sns-v11.rednotecdn.com/live2.mp4"
+        );
+    }
+
+    #[test]
+    fn xhs_prefers_h265_then_origin_video_key_before_h264() {
+        let html_both = script(
+            json!({"noteData":{"data":{"noteData":{
+                "noteId":"6a325cd7000000002103d8e2",
+                "type":"video",
+                "title":"视频测试",
+                "imageList":[{"url":"http://sns-web-i10.rednotecdn.com/cover.jpg"}],
+                "video":{
+                    "consumer":{"originVideoKey":"pre_post/origin.mp4"},
+                    "media":{
+                        "video":{"duration":10},
+                        "stream":{
+                            "h264":[{"masterUrl":"http://sns-v11.rednotecdn.com/h264.mp4","avgBitrate":100}],
+                            "h265":[{"masterUrl":"http://sns-v11.rednotecdn.com/h265.mp4","avgBitrate":80}]
+                        }
+                    }
+                }
+            }}}}),
+            "window.__INITIAL_STATE__",
+        );
+        let parsed_both = parse_page(
+            &html_both,
+            "https://www.rednote.com/discovery/item/6a325cd7000000002103d8e2",
+            "xiaohongshu",
+        )
+        .unwrap();
+        assert_eq!(parsed_both.video, "http://sns-v11.rednotecdn.com/h265.mp4");
+        assert_eq!(parsed_both.videos.len(), 3);
+        assert_eq!(
+            parsed_both.videos[1].url,
+            "https://sns-video-bd.xhscdn.com/pre_post/origin.mp4"
+        );
+        assert_eq!(
+            parsed_both.videos[2].url,
+            "http://sns-v11.rednotecdn.com/h264.mp4"
+        );
+
+        let html_mobile = script(
+            json!({"noteData":{"data":{"noteData":{
+                "noteId":"6a325cd7000000002103d8e2",
+                "type":"video",
+                "title":"视频测试",
+                "imageList":[{"url":"http://sns-web-i10.rednotecdn.com/cover.jpg"}],
+                "video":{
+                    "consumer":{"originVideoKey":"pre_post/origin.mp4"},
+                    "media":{
+                        "video":{"duration":10},
+                        "stream":{"h264":[{"masterUrl":"http://sns-v11.rednotecdn.com/h264.mp4","avgBitrate":100}]}
+                    }
+                }
+            }}}}),
+            "window.__INITIAL_STATE__",
+        );
+        let parsed_mobile = parse_page(
+            &html_mobile,
+            "https://www.rednote.com/discovery/item/6a325cd7000000002103d8e2",
+            "xiaohongshu",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed_mobile.video,
+            "https://sns-video-bd.xhscdn.com/pre_post/origin.mp4"
+        );
+        assert_eq!(parsed_mobile.duration, 10);
+        assert_eq!(parsed_mobile.videos.len(), 2);
+        assert_eq!(
+            parsed_mobile.videos[1].url,
+            "http://sns-v11.rednotecdn.com/h264.mp4"
+        );
+    }
+
+    #[test]
+    fn xhs_empty_mobile_note_data_returns_unavailable_error() {
+        let html = script(
+            json!({"noteData":{"data":{},"errorNoteData":{"show":false}}}),
+            "window.__INITIAL_STATE__",
+        );
+        let error = parse_page(
+            &html,
+            "https://www.rednote.com/discovery/item/6afbf63c000000001c033ad2",
+            "xiaohongshu",
+        )
+        .unwrap_err();
+        assert!(error.is::<XhsMediaUnavailable>());
     }
 
     #[test]

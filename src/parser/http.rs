@@ -92,7 +92,12 @@ fn domains(platform: &str) -> &'static [&'static str] {
     match platform {
         "bilibili" => &["bilibili.com", "b23.tv", "bili2233.cn"],
         "douyin" => &["douyin.com", "iesdouyin.com", "amemv.com", "snssdk.com"],
-        "xiaohongshu" => &["xiaohongshu.com", "xhslink.com"],
+        "xiaohongshu" => &[
+            "xiaohongshu.com",
+            "rednote.com",
+            "xhslink.com",
+            "xhslink.cn",
+        ],
         "kuaishou" => &["kuaishou.com", "gifshow.com", "chenzhongtech.com"],
         "weibo" => &["weibo.com", "weibo.cn"],
         "twitter" => &["twitter.com", "x.com", "twimg.com", "t.co"],
@@ -134,9 +139,10 @@ fn is_xiaohongshu_restricted_redirect(platform: &str, next: &Url) -> bool {
         return false;
     };
     platform == "xiaohongshu"
-        && (domain_matches(host, "rednote.com")
-            || (domain_matches(host, "xiaohongshu.com")
-                && (next.path().starts_with("/login") || next.path().starts_with("/web-login"))))
+        && (domain_matches(host, "xiaohongshu.com") || domain_matches(host, "rednote.com"))
+        && (next.path().starts_with("/login")
+            || next.path().starts_with("/web-login")
+            || next.path().starts_with("/website-login"))
 }
 
 pub fn validate_site_url(raw: &str, platform: &str) -> Result<Url> {
@@ -366,9 +372,17 @@ impl SiteHttp {
                     .request(request_method.clone(), url.clone())
                     .headers(options.headers.clone());
                 if !options.headers.contains_key(reqwest::header::USER_AGENT)
-                    && matches!(platform, "douyin" | "kuaishou")
+                    && matches!(platform, "douyin" | "kuaishou" | "xiaohongshu")
                 {
                     request = request.header(reqwest::header::USER_AGENT, MOBILE_USER_AGENT);
+                }
+                if platform == "xiaohongshu"
+                    && !options
+                        .headers
+                        .contains_key(reqwest::header::ACCEPT_LANGUAGE)
+                {
+                    request =
+                        request.header(reqwest::header::ACCEPT_LANGUAGE, "zh-CN,zh;q=0.9,en;q=0.8");
                 }
                 if !options.headers.contains_key(REFERER) {
                     request =
@@ -530,8 +544,10 @@ impl SiteHttp {
                 "xiaohongshu",
                 RequestOptions {
                     stop_at: Some(|url| {
-                        url.host_str()
-                            .is_some_and(|host| domain_matches(host, "xiaohongshu.com"))
+                        url.host_str().is_some_and(|host| {
+                            domain_matches(host, "xiaohongshu.com")
+                                || domain_matches(host, "rednote.com")
+                        })
                     }),
                     ..RequestOptions::default()
                 },
@@ -761,6 +777,13 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        let rednote =
+            validate_site_url("https://www.rednote.com/discovery/item/abc", "xiaohongshu").unwrap();
+        assert!(
+            http.cookie_header(&rednote, "xiaohongshu")
+                .unwrap()
+                .is_none()
+        );
         assert!(validate_site_url("https://bili2233.cn/abc", "bilibili").is_ok());
     }
 
@@ -799,13 +822,21 @@ mod tests {
 
     #[test]
     fn recognizes_xiaohongshu_rednote_and_login_redirects() {
-        assert!(is_xiaohongshu_restricted_redirect(
+        assert!(!is_xiaohongshu_restricted_redirect(
             "xiaohongshu",
             &Url::parse("https://www.rednote.com/discovery/item/abc").unwrap()
         ));
         assert!(is_xiaohongshu_restricted_redirect(
             "xiaohongshu",
+            &Url::parse("https://www.rednote.com/login?redirectPath=/").unwrap()
+        ));
+        assert!(is_xiaohongshu_restricted_redirect(
+            "xiaohongshu",
             &Url::parse("https://www.xiaohongshu.com/login?redirectPath=/").unwrap()
+        ));
+        assert!(is_xiaohongshu_restricted_redirect(
+            "xiaohongshu",
+            &Url::parse("https://www.xiaohongshu.com/website-login/captcha").unwrap()
         ));
         assert!(!is_xiaohongshu_restricted_redirect(
             "xiaohongshu",
@@ -813,7 +844,7 @@ mod tests {
         ));
         assert!(!is_xiaohongshu_restricted_redirect(
             "douyin",
-            &Url::parse("https://www.rednote.com/").unwrap()
+            &Url::parse("https://www.rednote.com/login").unwrap()
         ));
     }
 }

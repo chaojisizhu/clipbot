@@ -48,7 +48,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
         ),
         (
             "xiaohongshu",
-            r"(?:https?://)?(?:www\.)?(?:xhslink\.com/(?:[a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+|xiaohongshu\.com/discovery/item/[a-zA-Z0-9_-]+(?:\?[^\s]*)?|xiaohongshu\.com/explore/[a-zA-Z0-9_-]+(?:\?[^\s]*)?)",
+            r"(?:https?://)?(?:www\.)?(?:xhslink\.(?:com|cn)/(?:[a-zA-Z0-9_-]+/)*[a-zA-Z0-9_-]+|(?:xiaohongshu|rednote)\.com/(?:discovery/item|explore|user/profile/[a-zA-Z0-9_-]+)/[a-zA-Z0-9_-]+(?:\?[^\s]*)?)",
         ),
         (
             "weibo",
@@ -278,6 +278,13 @@ mod tests {
             .find(|m| m.media_type == "xiaohongshu")
             .unwrap();
         assert!(hit.url.contains("xsec_token=ABC123%3D"));
+
+        let rednote_links = link_type_parser(
+            "看 https://www.rednote.com/discovery/item/6a325cd7000000002103d8e2?xsec_token=TOK123 与 https://xhslink.cn/m/abc",
+        );
+        assert_eq!(rednote_links.len(), 2);
+        assert!(rednote_links.iter().all(|m| m.media_type == "xiaohongshu"));
+        assert!(rednote_links[0].url.contains("xsec_token=TOK123"));
     }
 
     #[test]

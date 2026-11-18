@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio::time::Instant;
 use url::Url;
 
-use crate::parser::media::{TempMedia, download_media_temp, is_foreign_url};
+use crate::parser::media::{DownloadTimeoutError, TempMedia, download_media_temp, is_foreign_url};
 use crate::parser::process::spawn_capture;
 use crate::types::{AppConfig, ParsedData};
 
@@ -33,17 +33,54 @@ pub async fn download_parsed_temp(data: &ParsedData, config: &AppConfig) -> Resu
         path.ends_with(".m3u8") || path.ends_with(".mpd")
     });
     if !is_manifest && data.audio_url.is_none() {
-        return download_media_temp(
-            &data.video,
-            &proxies,
-            &data.media_headers,
-            Path::new(&config.output.temp_dir),
-            max_bytes,
-            config.resources.max_temp_bytes,
-            timeout,
-            data.video_decode_key.as_deref(),
-        )
-        .await;
+        let mut candidates: Vec<&str> = Vec::with_capacity(data.videos.len() + 1);
+        if !data.video.is_empty() {
+            candidates.push(data.video.as_str());
+        }
+        for quality in &data.videos {
+            if quality.url.is_empty() || candidates.contains(&quality.url.as_str()) {
+                continue;
+            }
+            let manifest_candidate = Url::parse(&quality.url).ok().is_some_and(|url| {
+                let path = url.path().to_ascii_lowercase();
+                path.ends_with(".m3u8") || path.ends_with(".mpd")
+            });
+            if !manifest_candidate {
+                candidates.push(quality.url.as_str());
+            }
+        }
+        let deadline = Instant::now() + timeout;
+        let mut last_error = None;
+        for (index, candidate) in candidates.iter().enumerate() {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if index > 0 && remaining < Duration::from_secs(5) {
+                break;
+            }
+            match download_media_temp(
+                candidate,
+                &proxies,
+                &data.media_headers,
+                Path::new(&config.output.temp_dir),
+                max_bytes,
+                config.resources.max_temp_bytes,
+                remaining,
+                data.video_decode_key.as_deref(),
+            )
+            .await
+            {
+                Ok(media) => return Ok(media),
+                Err(error) => {
+                    let stop = error.is::<DownloadTimeoutError>();
+                    last_error = Some(error);
+                    if stop {
+                        break;
+                    }
+                }
+            }
+        }
+        return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("缺少可下载的视频地址")));
     }
     ensure!(data.video_decode_key.is_none(), "视频号加密流需要直接下载");
     ensure!(
