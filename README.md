@@ -91,6 +91,7 @@ Compose 默认构建 `media` 镜像，以非 root 用户运行，配置及 Cooki
 | 配置项 | 用途 |
 | --- | --- |
 | `qqbot.appId`、`qqbot.appSecret` | QQ 官方机器人凭据 |
+| `qqbot.superAdminOpenid` | 唯一超级管理员 OpenID（私聊 `/openid` 可查），用于 `拉黑@xx <理由>` / `滚出去@xxx` |
 | `qqbot.autoParse`、`qqbot.commandPrefix` | 自动解析和手动命令 |
 | `auth.cookies.<平台>` | 浏览器完整 Cookie 请求头 |
 | `auth.cookieFiles.<平台>` | Netscape 格式 Cookie 文件 |

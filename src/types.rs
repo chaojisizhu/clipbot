@@ -18,6 +18,8 @@ pub struct QQBotConfig {
     pub show_waiting_tip: bool,
     pub show_parse_error: bool,
     pub debug: bool,
+    pub super_admin_openid: String,
+    pub blacklist_file: String,
 }
 
 impl Default for QQBotConfig {
@@ -34,6 +36,8 @@ impl Default for QQBotConfig {
             show_waiting_tip: true,
             show_parse_error: true,
             debug: false,
+            super_admin_openid: String::new(),
+            blacklist_file: String::new(),
         }
     }
 }
@@ -461,14 +465,48 @@ pub enum ChatType {
     Private,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QQMention {
+    pub id: String,
+    pub member_openid: String,
+    pub user_openid: String,
+    pub username: String,
+    pub member_nickname: String,
+    pub is_you: bool,
+    pub bot: bool,
+    pub scope: String,
+}
+
+impl QQMention {
+    pub fn target_openid(&self) -> &str {
+        if !self.member_openid.is_empty() {
+            &self.member_openid
+        } else if !self.user_openid.is_empty() {
+            &self.user_openid
+        } else {
+            &self.id
+        }
+    }
+
+    pub fn display_name(&self) -> &str {
+        if !self.member_nickname.is_empty() {
+            &self.member_nickname
+        } else {
+            &self.username
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct QQChatEvent {
     pub chat_type: ChatType,
     pub chat_id: String,
     pub message_id: String,
+    pub sender_id: String,
     pub sender_name: String,
     pub current_text: String,
     pub text: String,
+    pub mentions: Vec<QQMention>,
     pub card_title: Option<String>,
     pub card_source: Option<String>,
     pub quoted_message_id: Option<String>,
@@ -520,7 +558,7 @@ impl std::error::Error for QQApiError {}
 pub enum BotEvent {
     Ready(serde_json::Value),
     Resumed(serde_json::Value),
-    Message(QQChatEvent),
+    Message(Box<QQChatEvent>),
 }
 
 #[cfg(test)]

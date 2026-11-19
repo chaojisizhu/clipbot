@@ -19,7 +19,7 @@ use crate::bot::message::{
     extract_card_fields, extract_current_text_from_qq_event, extract_quoted_content_from_qq_event,
     extract_text_from_qq_event, strip_leading_self_mentions,
 };
-use crate::types::{BotEvent, ChatType, QQApiError, QQBotConfig, QQChatEvent};
+use crate::types::{BotEvent, ChatType, QQApiError, QQBotConfig, QQChatEvent, QQMention};
 
 pub const INTENT_GROUP_AND_C2C: u64 = 1 << 25;
 const PASSIVE_FALLBACK_CODES: &[i64] = &[40_034_128, 40_034_005, 40_034_026, 304_027];
@@ -189,6 +189,10 @@ impl QQBotClient {
 
     pub fn config(&self) -> &QQBotConfig {
         &self.config
+    }
+
+    pub async fn bot_user_id(&self) -> Option<String> {
+        self.bot_user_id.lock().await.clone()
     }
 
     pub fn stop(&self) {
@@ -630,7 +634,7 @@ impl QQBotClient {
                 }
             }
         }
-        self.publish_event(events, BotEvent::Message(event));
+        self.publish_event(events, BotEvent::Message(Box::new(event)));
     }
 
     fn publish_event(&self, events: &mpsc::Sender<BotEvent>, event: BotEvent) {
@@ -673,13 +677,34 @@ impl QQBotClient {
             other => other.to_string(),
         };
         let chat_id = chat_id.to_string();
+        let sender_id = match chat_type {
+            ChatType::Group => json_id_string(data.pointer("/author/member_openid"))
+                .or_else(|| json_id_string(data.pointer("/author/id"))),
+            ChatType::Private => json_id_string(data.pointer("/author/user_openid"))
+                .or_else(|| json_id_string(data.pointer("/author/id"))),
+        }
+        .unwrap_or_default();
+        let mentions = extract_mentions(data);
         let raw_current_text = extract_current_text_from_qq_event(data);
         let raw_text = extract_text_from_qq_event(data);
         let bot_user_id = self.bot_user_id.lock().await.clone();
-        let self_ids = [
-            bot_user_id.as_deref().unwrap_or_default(),
-            &self.config.app_id,
-        ];
+        let mut self_id_storage = Vec::new();
+        if let Some(id) = &bot_user_id {
+            self_id_storage.push(id.clone());
+        }
+        if !self.config.app_id.is_empty() {
+            self_id_storage.push(self.config.app_id.clone());
+        }
+        for mention in &mentions {
+            if mention.is_you {
+                for candidate in [&mention.id, &mention.member_openid, &mention.user_openid] {
+                    if !candidate.is_empty() && !self_id_storage.contains(candidate) {
+                        self_id_storage.push(candidate.clone());
+                    }
+                }
+            }
+        }
+        let self_ids: Vec<&str> = self_id_storage.iter().map(String::as_str).collect();
         let (current_text, current_mention_removed) =
             strip_leading_self_mentions(&raw_current_text, &self_ids);
         let (text, aggregate_mention_removed) = strip_leading_self_mentions(&raw_text, &self_ids);
@@ -725,17 +750,23 @@ impl QQBotClient {
             );
         }
         let (card_title, card_source) = extract_card_fields(data);
+        let sender_name = data
+            .pointer("/author/member_nickname")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| data.pointer("/author/username").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
         Some(QQChatEvent {
             chat_type,
             chat_id,
             message_id,
-            sender_name: data
-                .pointer("/author/username")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            sender_id,
+            sender_name,
             current_text: current_text.to_owned(),
             text: text.to_owned(),
+            mentions,
             card_title,
             card_source,
             quoted_message_id: quoted.message_id,
@@ -1411,6 +1442,77 @@ impl QQBotClient {
             Err(error) => Err(error),
         }
     }
+}
+
+fn json_id_string(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn json_bool_field(value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    value.as_bool().unwrap_or_else(|| {
+        value
+            .as_str()
+            .is_some_and(|text| text.trim().eq_ignore_ascii_case("true"))
+    })
+}
+
+fn extract_mentions(data: &Value) -> Vec<QQMention> {
+    let Some(items) = data.get("mentions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = json_id_string(item.get("id")).unwrap_or_default();
+            let member_openid = json_id_string(item.get("member_openid")).unwrap_or_default();
+            let user_openid = json_id_string(item.get("user_openid")).unwrap_or_default();
+            let username = item
+                .get("username")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let member_nickname = item
+                .get("member_nickname")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let is_you = json_bool_field(item.get("is_you"));
+            let bot = json_bool_field(item.get("bot"));
+            let scope = item
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if id.is_empty()
+                && member_openid.is_empty()
+                && user_openid.is_empty()
+                && scope.is_empty()
+            {
+                return None;
+            }
+            Some(QQMention {
+                id,
+                member_openid,
+                user_openid,
+                username,
+                member_nickname,
+                is_you,
+                bot,
+                scope,
+            })
+        })
+        .collect()
 }
 
 fn platform_name() -> &'static str {

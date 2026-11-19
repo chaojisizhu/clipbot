@@ -10,6 +10,9 @@ use serde_json::Value;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
+use crate::bot::blacklist::{
+    BanOutcome, BlacklistCommand, BlacklistStore, format_user_label, parse_blacklist_command,
+};
 use crate::bot::message::{
     MarkdownOptions, build_result_markdown, markdown_payload, media_payload, quoted_text_payload,
     text_payload,
@@ -50,6 +53,7 @@ pub struct AppState {
     local_proxies: Vec<String>,
     gallery_material_gate: tokio::sync::Mutex<()>,
     owned_materials: std::sync::Mutex<Result<OwnedMaterials, String>>,
+    blacklist: std::sync::Mutex<Result<BlacklistStore, String>>,
 }
 
 struct GalleryImage {
@@ -130,6 +134,11 @@ impl AppState {
         }
         let owned_materials = OwnedMaterials::new(Path::new(&config.output.temp_dir))
             .map_err(|error| format!("{error:#}"));
+        let blacklist = BlacklistStore::open(BlacklistStore::resolve_path(&config))
+            .map_err(|error| format!("{error:#}"));
+        if let Err(ref error) = blacklist {
+            warn!("初始化全局黑名单失败: {error}");
+        }
         Self {
             config,
             parser,
@@ -139,10 +148,17 @@ impl AppState {
             local_proxies,
             gallery_material_gate: tokio::sync::Mutex::new(()),
             owned_materials: std::sync::Mutex::new(owned_materials),
+            blacklist: std::sync::Mutex::new(blacklist),
         }
     }
 
     pub async fn handle_message(self: Arc<Self>, event: QQChatEvent) {
+        if self.handle_openid_command(&event).await {
+            return;
+        }
+        if self.handle_blacklist_command(&event).await {
+            return;
+        }
         if self.handle_gpt_detect(&event).await {
             return;
         }
@@ -180,10 +196,20 @@ impl AppState {
         } else {
             link_type_parser(&target_text)
         };
+        let will_resolve_card = matches.is_empty()
+            && event.card_title.is_some()
+            && self.config.qqbot.parse_miniapp_cards;
+        let has_enabled_match = matches
+            .iter()
+            .any(|item| self.config.platform_enabled(&item.media_type));
+        if (is_command || will_resolve_card || has_enabled_match)
+            && self.reply_if_blacklisted(&event).await
+        {
+            return;
+        }
         let mut card_resolved = false;
 
-        if matches.is_empty() && event.card_title.is_some() && self.config.qqbot.parse_miniapp_cards
-        {
+        if will_resolve_card {
             if self.config.qqbot.show_waiting_tip
                 && !self.config.ui_text.waiting_tip_text.is_empty()
             {
@@ -355,6 +381,167 @@ impl AppState {
         }
     }
 
+    fn is_super_admin(&self, event: &QQChatEvent) -> bool {
+        let admin_openid = self.config.qqbot.super_admin_openid.trim();
+        let sender_id = event.sender_id.trim();
+        !admin_openid.is_empty() && !sender_id.is_empty() && sender_id == admin_openid
+    }
+
+    fn with_blacklist<T>(
+        &self,
+        operation: impl FnOnce(&mut BlacklistStore) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let mut state = self
+            .blacklist
+            .lock()
+            .map_err(|_| anyhow::anyhow!("黑名单状态锁不可用"))?;
+        let store = state
+            .as_mut()
+            .map_err(|error| anyhow::anyhow!("黑名单状态不可用: {error}"))?;
+        operation(store)
+    }
+
+    async fn handle_openid_command(&self, event: &QQChatEvent) -> bool {
+        let text = if event.current_text.is_empty() {
+            event.text.trim()
+        } else {
+            event.current_text.trim()
+        };
+        if !text.eq_ignore_ascii_case("/openid") {
+            return false;
+        }
+        if event.chat_type != ChatType::Private {
+            return true;
+        }
+        let sender_id = event.sender_id.trim();
+        let message = if sender_id.is_empty() {
+            "暂未获取到你的 OpenID".to_string()
+        } else {
+            format!("你的 OpenID: {sender_id}")
+        };
+        self.send_message(event, text_payload(message)).await;
+        true
+    }
+
+    async fn handle_blacklist_command(&self, event: &QQChatEvent) -> bool {
+        let bot_user_id = self.bot.bot_user_id().await;
+        let self_ids = [
+            bot_user_id.as_deref().unwrap_or_default(),
+            self.bot.config().app_id.as_str(),
+        ];
+        let Some(command) = parse_blacklist_command(event, &self_ids) else {
+            return false;
+        };
+        if !self.is_super_admin(event) {
+            return true;
+        }
+        match command {
+            BlacklistCommand::MissingTarget { is_add } => {
+                let action = if is_add { "拉黑" } else { "移出黑名单" };
+                self.send_message(
+                    event,
+                    text_payload(format!(
+                        "未识别到要{action}的目标用户，请在群内使用 QQ 的 @成员 功能点选目标，或直接附带目标 32 位 OpenID。"
+                    )),
+                )
+                .await;
+            }
+            BlacklistCommand::Add { targets, reason } => {
+                let admin_openid = self.config.qqbot.super_admin_openid.trim();
+                let mut lines = Vec::new();
+                for target in targets {
+                    if !admin_openid.is_empty() && target.openid == admin_openid {
+                        lines.push("不能将唯一超级管理员加入黑名单".to_string());
+                        continue;
+                    }
+                    let label = target.display_label();
+                    match self
+                        .with_blacklist(|store| store.add(&target.openid, &target.name, &reason))
+                    {
+                        Ok(BanOutcome::Added) => {
+                            info!(openid = %target.openid, reason = %reason, "已加入全局黑名单");
+                            lines.push(format!("已将 {label} 加入全局黑名单，理由: {reason}"));
+                        }
+                        Ok(BanOutcome::Updated) => {
+                            info!(openid = %target.openid, reason = %reason, "已更新全局黑名单理由");
+                            lines.push(format!("已更新 {label} 的黑名单理由: {reason}"));
+                        }
+                        Err(error) => {
+                            warn!("写入全局黑名单失败: {error}");
+                            lines.push(format!("❌ 加入黑名单失败: {error}"));
+                        }
+                    }
+                }
+                self.send_message(event, text_payload(lines.join("\n")))
+                    .await;
+            }
+            BlacklistCommand::Remove { targets } => {
+                let mut lines = Vec::new();
+                for target in targets {
+                    let label = target.display_label();
+                    match self.with_blacklist(|store| store.remove(&target.openid)) {
+                        Ok(Some(removed)) => {
+                            let display = if target.name.is_empty() && !removed.name.is_empty() {
+                                format_user_label(&removed.name, &removed.openid)
+                            } else {
+                                label
+                            };
+                            info!(openid = %target.openid, "已移出全局黑名单");
+                            lines.push(format!("已将 {display} 移出全局黑名单"));
+                        }
+                        Ok(None) => {
+                            lines.push(format!("{label} 不在全局黑名单中"));
+                        }
+                        Err(error) => {
+                            warn!("移出全局黑名单失败: {error}");
+                            lines.push(format!("❌ 移出黑名单失败: {error}"));
+                        }
+                    }
+                }
+                self.send_message(event, text_payload(lines.join("\n")))
+                    .await;
+            }
+        }
+        true
+    }
+
+    async fn reply_if_blacklisted(&self, event: &QQChatEvent) -> bool {
+        let sender_id = event.sender_id.trim();
+        if sender_id.is_empty() || self.is_super_admin(event) {
+            return false;
+        }
+        let reason = match self
+            .with_blacklist(|store| Ok(store.reason(sender_id).map(ToString::to_string)))
+        {
+            Ok(reason) => reason,
+            Err(error) => {
+                warn!("读取全局黑名单失败: {error}");
+                None
+            }
+        };
+        let Some(reason) = reason else {
+            return false;
+        };
+        info!(openid = %sender_id, "命中全局黑名单，已拦截请求");
+        let payload = text_payload(format!("您已被加入全局黑名单，理由: {reason}"));
+        match self.bot.reply(event, &payload).await {
+            Ok(_) => {}
+            Err(QQBotError::Api(error)) if error.err_code == QQ_ERR_CONTENT_VIOLATION => {
+                warn!(
+                    err_code = error.err_code,
+                    trace_id = error.trace_id.as_deref().unwrap_or(""),
+                    "黑名单提示中的理由触发腾讯审核拦截，降级发送无理由提示: {error}"
+                );
+                self.send_message(event, text_payload("您已被加入全局黑名单"))
+                    .await;
+            }
+            Err(error) => {
+                warn!("QQ 黑名单提示发送失败: {error}");
+            }
+        }
+        true
+    }
+
     async fn handle_gpt_detect(&self, event: &QQChatEvent) -> bool {
         if !self.config.gpt_detect.enabled {
             return false;
@@ -366,6 +553,9 @@ impl AppState {
         };
         if !matches_gpt_detect_keyword(current_text, &self.config.gpt_detect.keywords) {
             return false;
+        }
+        if self.reply_if_blacklisted(event).await {
+            return true;
         }
         if event.quoted_message_id.is_none() || event.quoted_images.is_empty() {
             self.send_message(event, text_payload("请引用一张图片，然后精确回复“ai吗”。"))
@@ -1469,6 +1659,262 @@ mod tests {
         assert!(md.contains("作者：陈睿"));
         assert!(md.contains("就在今天！\n我们是冠军！！！"));
         assert!(md.contains("点赞：38000"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn openid_command_and_blacklist_workflow_work_end_to_end() {
+        use axum::{Json, Router, extract::Path, routing::post};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let sent = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let captured_group = Arc::clone(&sent);
+        let captured_user = Arc::clone(&sent);
+        let app = Router::new()
+            .route(
+                "/app/getAppAccessToken",
+                post(|| async { Json(json!({"access_token":"BL_TOKEN","expires_in":7200})) }),
+            )
+            .route(
+                "/v2/groups/{group}/messages",
+                post(move |Path(group): Path<String>, Json(body): Json<Value>| {
+                    let captured_group = Arc::clone(&captured_group);
+                    async move {
+                        captured_group
+                            .lock()
+                            .await
+                            .push((format!("group:{group}"), body));
+                        Json(json!({"id":"sent-group-1"}))
+                    }
+                }),
+            )
+            .route(
+                "/v2/users/{user}/messages",
+                post(move |Path(user): Path<String>, Json(body): Json<Value>| {
+                    let captured_user = Arc::clone(&captured_user);
+                    async move {
+                        captured_user
+                            .lock()
+                            .await
+                            .push((format!("user:{user}"), body));
+                        Json(json!({"id":"sent-user-1"}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.qqbot.app_id = "bot-app".into();
+        config.qqbot.app_secret = "bot-secret".into();
+        config.qqbot.api_base = base.clone();
+        config.qqbot.super_admin_openid = "ADMIN_OPENID".into();
+        config.qqbot.show_waiting_tip = false;
+        config.gpt_detect.enabled = true;
+        config.output.temp_dir = temp_dir.path().to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        ));
+
+        // 1. /openid only replies in Private chat, silent in Group
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m1".into(),
+                sender_id: "USER_A".into(),
+                current_text: "/openid".into(),
+                text: "/openid".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert!(sent.lock().await.is_empty());
+
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Private,
+                chat_id: "USER_A".into(),
+                message_id: "m2".into(),
+                sender_id: "USER_A".into(),
+                current_text: "/openid".into(),
+                text: "/openid".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        {
+            let guard = sent.lock().await;
+            assert_eq!(guard.len(), 1);
+            assert_eq!(guard[0].0, "user:USER_A");
+            assert_eq!(guard[0].1["content"], "你的 OpenID: USER_A");
+        }
+
+        // 2. Non-super-admin invoking 拉黑/滚出去 is ignored silently
+        for text in ["拉黑<@USER_B> 刷屏", "滚出去<@USER_B>", "拉黑@不存在的人"] {
+            Arc::clone(&state)
+                .handle_message(QQChatEvent {
+                    chat_type: ChatType::Group,
+                    chat_id: "GROUP_1".into(),
+                    message_id: format!("nonadmin-{text}"),
+                    sender_id: "USER_A".into(),
+                    current_text: text.into(),
+                    text: text.into(),
+                    ..QQChatEvent::default()
+                })
+                .await;
+        }
+        assert_eq!(sent.lock().await.len(), 1);
+
+        // 3. Super admin cannot ban self
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m3".into(),
+                sender_id: "ADMIN_OPENID".into(),
+                current_text: "拉黑<@ADMIN_OPENID> 测试".into(),
+                text: "拉黑<@ADMIN_OPENID> 测试".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(
+            sent.lock().await.last().unwrap().1["content"],
+            "不能将唯一超级管理员加入黑名单"
+        );
+
+        // 4. Super admin bans USER_A without reason -> default reason "你已被权限"
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m4".into(),
+                sender_id: "ADMIN_OPENID".into(),
+                current_text: "拉黑<@USER_A>".into(),
+                text: "拉黑<@USER_A>".into(),
+                mentions: vec![crate::types::QQMention {
+                    id: "USER_A".into(),
+                    member_openid: "USER_A".into(),
+                    username: "测试号A".into(),
+                    ..crate::types::QQMention::default()
+                }],
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(
+            sent.lock().await.last().unwrap().1["content"],
+            "已将 测试号A (USER_A) 加入全局黑名单，理由: 你已被权限"
+        );
+
+        // 5. Blocked USER_A normal group chatter stays silent (no spam!)
+        let count_before_chatter = sent.lock().await.len();
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m5".into(),
+                sender_id: "USER_A".into(),
+                current_text: "大家好呀今天吃什么".into(),
+                text: "大家好呀今天吃什么".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(sent.lock().await.len(), count_before_chatter);
+
+        // 6. Blocked USER_A triggers "ai吗" and parsing in another group & private chat -> blocked reply!
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_2".into(),
+                message_id: "m6".into(),
+                sender_id: "USER_A".into(),
+                current_text: "ai吗".into(),
+                text: "ai吗".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(
+            sent.lock().await.last().unwrap().1["content"],
+            "您已被加入全局黑名单，理由: 你已被权限"
+        );
+
+        // Update reason via super admin
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m7".into(),
+                sender_id: "ADMIN_OPENID".into(),
+                current_text: "拉黑 <@USER_A> 恶意刷链接".into(),
+                text: "拉黑 <@USER_A> 恶意刷链接".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+
+        // Reconstruct AppState from disk to verify persistence across restarts
+        let reloaded = Arc::new(AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        ));
+        Arc::clone(&reloaded)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Private,
+                chat_id: "USER_A".into(),
+                message_id: "m8".into(),
+                sender_id: "USER_A".into(),
+                current_text: "https://www.bilibili.com/video/BV1GJ411x7h7".into(),
+                text: "https://www.bilibili.com/video/BV1GJ411x7h7".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        {
+            let guard = sent.lock().await;
+            assert_eq!(guard.last().unwrap().0, "user:USER_A");
+            assert_eq!(
+                guard.last().unwrap().1["content"],
+                "您已被加入全局黑名单，理由: 恶意刷链接"
+            );
+        }
+
+        // 7. Super admin unbans USER_A via 滚出去@xxx -> normal usage restored
+        Arc::clone(&reloaded)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m9".into(),
+                sender_id: "ADMIN_OPENID".into(),
+                current_text: "滚出去<@USER_A>".into(),
+                text: "滚出去<@USER_A>".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(
+            sent.lock().await.last().unwrap().1["content"],
+            "已将 测试号A (USER_A) 移出全局黑名单"
+        );
+
+        Arc::clone(&reloaded)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_2".into(),
+                message_id: "m10".into(),
+                sender_id: "USER_A".into(),
+                current_text: "ai吗".into(),
+                text: "ai吗".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(
+            sent.lock().await.last().unwrap().1["content"],
+            "请引用一张图片，然后精确回复“ai吗”。"
+        );
+
         server.abort();
     }
 }

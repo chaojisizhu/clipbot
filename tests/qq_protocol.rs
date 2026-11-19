@@ -147,6 +147,23 @@ async fn group_messages(
     }
 }
 
+async fn user_messages(
+    State(state): State<MockState>,
+    Path(user): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    record(
+        &state,
+        format!("/v2/users/{user}/messages"),
+        "POST",
+        &headers,
+        body,
+    )
+    .await;
+    Json(json!({ "id": "ROBOT1.0_sent_dm", "timestamp": "2026-09-23T00:00:00+08:00" }))
+}
+
 async fn group_files(
     State(state): State<MockState>,
     Path(_group): Path<String>,
@@ -314,6 +331,7 @@ async fn start_mock_with_parallel_puts(
         .route("/gateway", get(gateway))
         .route("/ws", get(websocket))
         .route("/v2/groups/{group}/messages", post(group_messages))
+        .route("/v2/users/{user}/messages", post(user_messages))
         .route("/v2/groups/{group}/files", post(group_files))
         .route("/v2/groups/{group}/upload_prepare", post(upload_prepare))
         .route(
@@ -385,7 +403,7 @@ async fn gateway_reply_and_chunked_upload_protocol() {
         .unwrap()
         .unwrap()
     {
-        BotEvent::Message(event) => event,
+        BotEvent::Message(event) => *event,
         other => panic!("expected message event, got {other:?}"),
     };
     assert_eq!(event.chat_id, "GROUP001");
@@ -755,7 +773,7 @@ async fn mentioned_manual_commands_reach_message_handler_with_auto_parse_disable
             };
             assert_eq!(event.current_text, "解析 没有链接");
             assert_eq!(event.text, "解析 没有链接");
-            Arc::clone(&app).handle_message(event).await;
+            Arc::clone(&app).handle_message(*event).await;
             expected_messages += 1;
             let calls = state.calls.lock().await;
             let messages = calls
@@ -786,7 +804,7 @@ async fn mentioned_manual_commands_reach_message_handler_with_auto_parse_disable
         };
         assert_eq!(event.current_text, foreign_content);
         assert_eq!(event.text, foreign_content);
-        Arc::clone(&app).handle_message(event).await;
+        Arc::clone(&app).handle_message(*event).await;
         assert_eq!(
             state
                 .calls
@@ -816,7 +834,7 @@ async fn mentioned_manual_commands_reach_message_handler_with_auto_parse_disable
     else {
         panic!("expected whitespace command");
     };
-    Arc::clone(&app).handle_message(event).await;
+    Arc::clone(&app).handle_message(*event).await;
     expected_messages += 1;
     let calls = state.calls.lock().await.clone();
     let messages = calls
@@ -846,7 +864,7 @@ async fn mentioned_manual_commands_reach_message_handler_with_auto_parse_disable
     };
     assert!(event.current_text.is_empty());
     assert_eq!(event.text, "解析 没有链接");
-    Arc::clone(&app).handle_message(event).await;
+    Arc::clone(&app).handle_message(*event).await;
     assert_eq!(
         state
             .calls
@@ -939,5 +957,173 @@ async fn api_error_captures_err_code_and_trace_id_from_body_or_header() {
         "消息内容违规 (err_code: 40034006, trace_id: header-trace-456)"
     );
 
+    server.abort();
+}
+
+#[tokio::test]
+async fn gateway_extracts_sender_openid_and_mentions_for_openid_and_blacklist() {
+    let (state, server) = start_mock().await;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig {
+        qqbot: QQBotConfig {
+            app_id: "123456".into(),
+            app_secret: "test-secret".into(),
+            api_base: state.http_base.clone(),
+            receive_all_messages: true,
+            auto_parse: true,
+            super_admin_openid: "ADMIN_HEX_001".into(),
+            show_waiting_tip: false,
+            ..QQBotConfig::default()
+        },
+        ..AppConfig::default()
+    };
+    config.output.temp_dir = temp_dir.path().to_string_lossy().into_owned();
+    let config = Arc::new(config);
+    let bot = Arc::new(QQBotClient::new(config.qqbot.clone()));
+    let parser = Arc::new(VideoParserService::new((*config).clone()).unwrap());
+    let app = Arc::new(AppState::new(config, parser, Arc::clone(&bot)));
+    let (events_tx, mut events_rx) = mpsc::channel(32);
+    let bot_task = tokio::spawn(Arc::clone(&bot).run(events_tx));
+    wait_for_identify(&state).await;
+
+    push_event(
+        &state,
+        json!({
+            "op": 0, "s": 1, "t": "READY",
+            "d": { "session_id": "bl-session", "user": { "id": "ready-bot", "username": "mockbot" } }
+        }),
+    )
+    .await;
+    assert!(matches!(
+        timeout(Duration::from_secs(2), events_rx.recv())
+            .await
+            .unwrap(),
+        Some(BotEvent::Ready(_))
+    ));
+
+    // C2C /openid returns user_openid
+    push_event(
+        &state,
+        json!({
+            "op": 0, "s": 2, "t": "C2C_MESSAGE_CREATE",
+            "d": {
+                "id": "dm-openid-1",
+                "content": "/openid",
+                "author": { "id": "USER_DM_01", "user_openid": "USER_DM_01", "username": "" }
+            }
+        }),
+    )
+    .await;
+    let Some(BotEvent::Message(dm_event)) = timeout(Duration::from_secs(2), events_rx.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected C2C message event");
+    };
+    assert_eq!(dm_event.sender_id, "USER_DM_01");
+    Arc::clone(&app).handle_message(*dm_event).await;
+
+    // GROUP_MESSAGE_CREATE with @bot (via mentions[].is_you) + 拉黑@target
+    push_event(
+        &state,
+        json!({
+            "op": 0, "s": 3, "t": "GROUP_MESSAGE_CREATE",
+            "d": {
+                "id": "grp-ban-1",
+                "group_openid": "GROUP001",
+                "content": "<@BOT_GROUP_OPENID> 拉黑<@TARGET_01> 发广告",
+                "author": {
+                    "id": "ADMIN_HEX_001",
+                    "member_openid": "ADMIN_HEX_001",
+                    "member_nickname": "群主管理员",
+                    "username": "admin"
+                },
+                "mentions": [
+                    {
+                        "id": "BOT_GROUP_OPENID",
+                        "member_openid": "BOT_GROUP_OPENID",
+                        "is_you": true,
+                        "bot": true,
+                        "scope": "single"
+                    },
+                    {
+                        "id": "TARGET_01",
+                        "member_openid": "TARGET_01",
+                        "member_nickname": "违规群友",
+                        "username": "target",
+                        "is_you": false,
+                        "bot": false,
+                        "scope": "single"
+                    }
+                ]
+            }
+        }),
+    )
+    .await;
+    let Some(BotEvent::Message(ban_event)) = timeout(Duration::from_secs(2), events_rx.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected group ban message event");
+    };
+    assert_eq!(ban_event.sender_id, "ADMIN_HEX_001");
+    assert_eq!(ban_event.sender_name, "群主管理员");
+    assert_eq!(ban_event.current_text, "拉黑<@TARGET_01> 发广告");
+    Arc::clone(&app).handle_message(*ban_event).await;
+
+    // TARGET_01 triggers parsing in GROUP_AT_MESSAGE_CREATE -> gets blocked notice
+    push_event(
+        &state,
+        json!({
+            "op": 0, "s": 4, "t": "GROUP_AT_MESSAGE_CREATE",
+            "d": {
+                "id": "grp-blocked-1",
+                "group_openid": "GROUP001",
+                "content": "解析 https://www.bilibili.com/video/BV1GJ411x7h7",
+                "author": {
+                    "id": "TARGET_01",
+                    "member_openid": "TARGET_01",
+                    "username": "target"
+                }
+            }
+        }),
+    )
+    .await;
+    let Some(BotEvent::Message(blocked_event)) = timeout(Duration::from_secs(2), events_rx.recv())
+        .await
+        .unwrap()
+    else {
+        panic!("expected blocked user event");
+    };
+    Arc::clone(&app).handle_message(*blocked_event).await;
+
+    let calls = state.calls.lock().await;
+    let dm_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| call.path == "/v2/users/USER_DM_01/messages")
+        .collect();
+    assert_eq!(dm_calls.len(), 1);
+    assert_eq!(dm_calls[0].body["content"], "你的 OpenID: USER_DM_01");
+
+    let group_calls: Vec<_> = calls
+        .iter()
+        .filter(|call| call.path == "/v2/groups/GROUP001/messages")
+        .collect();
+    assert_eq!(group_calls.len(), 2);
+    assert_eq!(
+        group_calls[0].body["content"],
+        "已将 违规群友 (TARGET_01) 加入全局黑名单，理由: 发广告"
+    );
+    assert_eq!(
+        group_calls[1].body["content"],
+        "您已被加入全局黑名单，理由: 发广告"
+    );
+
+    bot.stop();
+    timeout(Duration::from_secs(2), bot_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     server.abort();
 }

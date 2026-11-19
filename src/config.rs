@@ -70,6 +70,8 @@ fn normalize_config(mut config: AppConfig) -> AppConfig {
     if config.gpt_detect.keywords.is_empty() {
         config.gpt_detect.keywords = vec!["ai吗".into()];
     }
+    config.qqbot.super_admin_openid = config.qqbot.super_admin_openid.trim().to_string();
+    config.qqbot.blacklist_file = config.qqbot.blacklist_file.trim().to_string();
     config
 }
 
@@ -77,6 +79,10 @@ fn apply_environment(config: &mut AppConfig) {
     for (name, target) in [
         ("QQBOT_APP_ID", &mut config.qqbot.app_id),
         ("QQBOT_APP_SECRET", &mut config.qqbot.app_secret),
+        (
+            "QQBOT_SUPER_ADMIN_OPENID",
+            &mut config.qqbot.super_admin_openid,
+        ),
         ("YUANBAO_COOKIE", &mut config.channels.yuanbao_cookie),
         ("ALLVIDEO_PROXY", &mut config.api.proxy),
     ] {
@@ -157,5 +163,20 @@ gptDetect:
         .unwrap();
         assert_eq!(cfg.gpt_detect.api_key, "legacy-key");
         assert_eq!(cfg.gpt_detect.api_keys, vec!["key-2", "key-3"]);
+    }
+
+    #[test]
+    fn parses_super_admin_openid_and_blacklist_file() {
+        let cfg: AppConfig = serde_yaml::from_str(
+            r#"
+qqbot:
+  superAdminOpenid: "  ADMIN_OPENID_001  "
+  blacklistFile: " /tmp/blacklist.json "
+"#,
+        )
+        .unwrap();
+        let normalized = normalize_config(cfg);
+        assert_eq!(normalized.qqbot.super_admin_openid, "ADMIN_OPENID_001");
+        assert_eq!(normalized.qqbot.blacklist_file, "/tmp/blacklist.json");
     }
 }

@@ -70,6 +70,7 @@ async fn run() -> Result<()> {
                     "version": env!("CARGO_PKG_VERSION"),
                     "parser": "native-rust",
                     "qqConfigured": !config.qqbot.app_id.is_empty() && !config.qqbot.app_secret.is_empty(),
+                    "superAdminConfigured": !config.qqbot.super_admin_openid.trim().is_empty(),
                     "yuanbaoConfigured": !config.channels.yuanbao_cookie.is_empty(),
                     "cookiePlatforms": config.auth.cookies.iter().filter(|(_, value)| !value.trim().is_empty()).map(|(key, _)| key).collect::<Vec<_>>(),
                     "cookieFilePlatforms": config.auth.cookie_files.keys().collect::<Vec<_>>(),
@@ -234,7 +235,7 @@ async fn run_bot(config: AppConfig, parser: Arc<VideoParserService>) -> Result<(
                 match event {
                     Some(BotEvent::Message(message)) => {
                         let state = Arc::clone(&state);
-                        workers.spawn(async move { state.handle_message(message).await; });
+                        workers.spawn(async move { state.handle_message(*message).await; });
                     }
                     Some(BotEvent::Ready(_)) => tracing::info!("QQ机器人已连接"),
                     Some(BotEvent::Resumed(_)) => tracing::info!("QQ会话已恢复"),

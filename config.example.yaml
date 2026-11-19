@@ -1,7 +1,11 @@
-# 凭据可通过 QQBOT_APP_ID、QQBOT_APP_SECRET、YUANBAO_COOKIE 环境变量提供。
+# 凭据可通过 QQBOT_APP_ID、QQBOT_APP_SECRET、QQBOT_SUPER_ADMIN_OPENID、YUANBAO_COOKIE 环境变量提供。
 qqbot:
   appId: ""
   appSecret: ""
+  # 唯一超级管理员 OpenID（私聊机器人发送 /openid 可查看自己的 OpenID）。
+  superAdminOpenid: ""
+  # 全局黑名单存储文件；留空时默认保存在 output.tempDir/.clipbot-blacklist.json。
+  blacklistFile: ""
   apiBase: "https://api.bot.qq.com"
   receiveAllMessages: true
   parseMiniappCards: false
