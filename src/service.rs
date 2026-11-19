@@ -31,8 +31,11 @@ use crate::parser::media::{
 };
 use crate::parser::remux::{download_live_album_temp, download_parsed_temp};
 use crate::types::{
-    AppConfig, ChatType, DEFAULT_MAX_MARKDOWN_IMAGES, ImageSize, LinkMatch, ParsedData, QQChatEvent,
+    AppConfig, ChatType, DEFAULT_MAX_MARKDOWN_IMAGES, ImageSize, LinkMatch, ParsedData, QQApiError,
+    QQChatEvent,
 };
+
+const QQ_ERR_CONTENT_VIOLATION: i64 = 40_034_006;
 
 static ARCHIVE_EXT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\.(7z|zip)$").unwrap());
 static JM_TASK_GATE: Semaphore = Semaphore::const_new(1);
@@ -991,10 +994,7 @@ impl AppState {
                 let notice = match error {
                     QQBotError::Api(error) => {
                         self.release_gallery_materials(&releasable).await;
-                        format!(
-                            "⚠️ 图集发送失败，本次 {selected_count} 张图片未发送，请稍后重试。（QQ 错误码 {}）",
-                            error.err_code
-                        )
+                        concise_gallery_api_error_note(selected_count, &error)
                     }
                     QQBotError::Other(_) => {
                         let ids: Vec<String> =
@@ -1177,6 +1177,9 @@ fn concise_video_transfer_note(error: &anyhow::Error) -> String {
     {
         return "⚠️ 视频上传 QQ 超时，请稍后重试。".into();
     }
+    if text.contains("40034006") || text.contains("消息内容违规") {
+        return "⚠️ 消息内容违规，触发腾讯审核拦截，无法发送。（QQ 错误码 40034006）".into();
+    }
     if text.contains("QQ 上传失败") {
         return "⚠️ QQ 暂无法接收该视频，请稍后再试。".into();
     }
@@ -1188,6 +1191,19 @@ fn concise_video_transfer_note(error: &anyhow::Error) -> String {
         return "⚠️ 视频下载超时（文件较大或原站拉取较慢），请稍后再试。".into();
     }
     "⚠️ 视频下载或处理失败，请稍后再试。".into()
+}
+
+fn concise_gallery_api_error_note(selected_count: usize, error: &QQApiError) -> String {
+    if error.err_code == QQ_ERR_CONTENT_VIOLATION {
+        return format!(
+            "⚠️ 图集发送失败，本次 {selected_count} 张图片未发送：消息内容违规，触发腾讯审核拦截。（QQ 错误码 {}）",
+            error.err_code
+        );
+    }
+    format!(
+        "⚠️ 图集发送失败，本次 {selected_count} 张图片未发送，请稍后重试。（QQ 错误码 {}）",
+        error.err_code
+    )
 }
 
 fn render_parse_error(config: &AppConfig, url: &str, message: &str) -> String {
@@ -1316,6 +1332,32 @@ mod tests {
                 "下载或合流失败（300014 ms）: 媒体下载失败: 视频下载超时（超过 300 秒）"
             )),
             "⚠️ 视频下载超时（文件较大或原站拉取较慢），请稍后再试。"
+        );
+        assert_eq!(
+            concise_video_transfer_note(&anyhow::anyhow!(
+                "QQ 上传失败（800 ms，下载 1200 ms）: {}",
+                QQApiError::new(
+                    QQ_ERR_CONTENT_VIOLATION,
+                    "消息内容违规",
+                    Some("trace-v1".into())
+                )
+            )),
+            "⚠️ 消息内容违规，触发腾讯审核拦截，无法发送。（QQ 错误码 40034006）"
+        );
+        assert_eq!(
+            concise_gallery_api_error_note(
+                2,
+                &QQApiError::new(
+                    QQ_ERR_CONTENT_VIOLATION,
+                    "消息内容违规",
+                    Some("trace-g1".into())
+                )
+            ),
+            "⚠️ 图集发送失败，本次 2 张图片未发送：消息内容违规，触发腾讯审核拦截。（QQ 错误码 40034006）"
+        );
+        assert_eq!(
+            concise_gallery_api_error_note(3, &QQApiError::new(40034141, "转存失败", None)),
+            "⚠️ 图集发送失败，本次 3 张图片未发送，请稍后重试。（QQ 错误码 40034141）"
         );
     }
 }

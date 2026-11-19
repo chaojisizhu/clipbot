@@ -866,3 +866,78 @@ async fn mentioned_manual_commands_reach_message_handler_with_auto_parse_disable
         .unwrap();
     server.abort();
 }
+
+#[tokio::test]
+async fn api_error_captures_err_code_and_trace_id_from_body_or_header() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/app/getAppAccessToken",
+            post(|| async { Json(json!({ "access_token": "TEST_TOKEN", "expires_in": 7200 })) }),
+        )
+        .route(
+            "/v2/groups/BODY_TRACE/messages",
+            post(|| async {
+                Json(json!({
+                    "err_code": 40_034_006,
+                    "message": "消息内容违规",
+                    "trace_id": "body-trace-123"
+                }))
+            }),
+        )
+        .route(
+            "/v2/groups/HEADER_TRACE/messages",
+            post(|| async {
+                (
+                    StatusCode::OK,
+                    [("X-Tps-trace-ID", "header-trace-456")],
+                    Json(json!({
+                        "err_code": 40_034_006,
+                        "message": "消息内容违规"
+                    })),
+                )
+            }),
+        );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = QQBotClient::new(QQBotConfig {
+        app_id: "app".into(),
+        app_secret: "secret".into(),
+        api_base: base,
+        ..QQBotConfig::default()
+    });
+
+    let err_body = client
+        .send_group_message("BODY_TRACE", &text_payload("test"))
+        .await
+        .unwrap_err();
+    match &err_body {
+        clipbot::bot::qqbot::QQBotError::Api(api) => {
+            assert_eq!(api.err_code, 40_034_006);
+            assert_eq!(api.trace_id.as_deref(), Some("body-trace-123"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(
+        err_body.to_string(),
+        "消息内容违规 (err_code: 40034006, trace_id: body-trace-123)"
+    );
+
+    let err_header = client
+        .send_group_message("HEADER_TRACE", &text_payload("test"))
+        .await
+        .unwrap_err();
+    match &err_header {
+        clipbot::bot::qqbot::QQBotError::Api(api) => {
+            assert_eq!(api.err_code, 40_034_006);
+            assert_eq!(api.trace_id.as_deref(), Some("header-trace-456"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(
+        err_header.to_string(),
+        "消息内容违规 (err_code: 40034006, trace_id: header-trace-456)"
+    );
+
+    server.abort();
+}

@@ -776,7 +776,21 @@ impl QQBotClient {
             tokio::time::sleep(Duration::from_secs(1)).await;
             return Box::pin(self.api_call(method, path, body, true, timeout)).await;
         }
+        let header_trace_id = response
+            .headers()
+            .get("x-tps-trace-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
         let data: Value = response.json().await.unwrap_or(Value::Null);
+        let trace_id = data
+            .get("trace_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .or(header_trace_id);
         if let Some(err_code) = data.get("err_code").filter(|value| json_truthy(value)) {
             let code = err_code.as_i64().unwrap_or_else(|| {
                 err_code
@@ -789,9 +803,7 @@ impl QQBotClient {
                 data.get("message")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
-                data.get("trace_id")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
+                trace_id,
             )
             .into());
         }
@@ -803,7 +815,7 @@ impl QQBotClient {
                     status.as_u16(),
                     data.to_string().chars().take(200).collect::<String>()
                 ),
-                None,
+                trace_id,
             )
             .into());
         }
@@ -1372,10 +1384,7 @@ impl QQBotClient {
         match result {
             Ok(result) => Ok(result),
             Err(QQBotError::Api(error)) if PASSIVE_FALLBACK_CODES.contains(&error.err_code) => {
-                warn!(
-                    "被动回复受限 (err_code: {})，转主动消息发送",
-                    error.err_code
-                );
+                warn!("被动回复受限，转主动消息发送: {error}");
                 let mut active = body.as_object().cloned().unwrap_or_default();
                 active.remove("msg_id");
                 active.remove("msg_seq");
@@ -1386,7 +1395,7 @@ impl QQBotClient {
                 }
             }
             Err(QQBotError::Api(error)) if error.err_code == DUPLICATE_SEQ_CODE => {
-                warn!("消息被去重 (err_code: 40054005)，递增 msg_seq 重试");
+                warn!("消息被去重，递增 msg_seq 重试: {error}");
                 let mut retried = body.as_object().cloned().unwrap_or_default();
                 retried.insert("msg_id".into(), Value::String(event.message_id.clone()));
                 retried.insert(

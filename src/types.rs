@@ -468,8 +468,7 @@ pub struct QQChatEvent {
     pub quoted_images: Vec<QQImageAttachment>,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{message}")]
+#[derive(Debug)]
 pub struct QQApiError {
     pub err_code: i64,
     pub message: String,
@@ -479,6 +478,9 @@ pub struct QQApiError {
 impl QQApiError {
     pub fn new(err_code: i64, message: impl Into<String>, trace_id: Option<String>) -> Self {
         let message = message.into();
+        let trace_id = trace_id
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty());
         Self {
             err_code,
             message: if message.is_empty() {
@@ -491,9 +493,41 @@ impl QQApiError {
     }
 }
 
+impl std::fmt::Display for QQApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.trace_id {
+            Some(trace_id) => write!(
+                formatter,
+                "{} (err_code: {}, trace_id: {trace_id})",
+                self.message, self.err_code
+            ),
+            None => write!(formatter, "{} (err_code: {})", self.message, self.err_code),
+        }
+    }
+}
+
+impl std::error::Error for QQApiError {}
+
 #[derive(Debug, Clone)]
 pub enum BotEvent {
     Ready(serde_json::Value),
     Resumed(serde_json::Value),
     Message(QQChatEvent),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QQApiError;
+
+    #[test]
+    fn formats_qq_api_error_with_err_code_and_trace_id() {
+        let with_trace = QQApiError::new(40_034_006, "消息内容违规", Some(" trace-abc ".into()));
+        assert_eq!(
+            with_trace.to_string(),
+            "消息内容违规 (err_code: 40034006, trace_id: trace-abc)"
+        );
+
+        let blank_trace = QQApiError::new(40_034_006, "消息内容违规", Some("   ".into()));
+        assert_eq!(blank_trace.to_string(), "消息内容违规 (err_code: 40034006)");
+    }
 }

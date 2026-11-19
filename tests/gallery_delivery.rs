@@ -189,7 +189,12 @@ async fn send_message(State(state): State<GalleryMock>, Json(body): Json<Value>)
     });
     state.messages.lock().await.push(body);
     if let Some(code) = error_code {
-        return Json(json!({"err_code":code,"message":"测试消息错误"}));
+        let message = if code == 40_034_006 {
+            "消息内容违规"
+        } else {
+            "测试消息错误"
+        };
+        return Json(json!({"err_code":code,"message":message,"trace_id":"mock-trace-1"}));
     }
     Json(json!({"id":"gallery-sent"}))
 }
@@ -526,6 +531,24 @@ async fn failed_markdown_material_reply_reports_undelivered_images_without_url_r
         assert_materials_removed_after_reply(&mock, &(0..9).collect::<Vec<_>>()).await;
         server.abort();
     }
+}
+
+#[tokio::test]
+async fn content_violation_40034006_reports_moderation_block_without_retry_hint() {
+    let (mock, app, server) = start_gallery_mock_with_count(None, Some(40_034_006), 30, 2).await;
+    deliver(Arc::clone(&app), "gallery-40034006").await;
+    let messages = mock.messages.lock().await.clone();
+    assert_eq!(messages.len(), 3);
+    assert!(messages.iter().all(|message| message["msg_type"] != 7));
+    let notice = messages.last().unwrap()["content"].as_str().unwrap();
+    assert_eq!(
+        notice,
+        "⚠️ 图集发送失败，本次 2 张图片未发送：消息内容违规，触发腾讯审核拦截。（QQ 错误码 40034006）"
+    );
+    assert_materials_removed_after_reply(&mock, &[0, 1]).await;
+    deliver(app, "gallery-40034006-retry").await;
+    assert_eq!(mock.messages.lock().await.len(), 6);
+    server.abort();
 }
 
 #[tokio::test]
