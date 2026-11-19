@@ -15,7 +15,7 @@ static RULES: Lazy<Vec<Rule>> = Lazy::new(|| {
     [
         (
             "bilibili",
-            r#"(?:https?://)?(?:(?:www\.)?bilibili\.com/(?:video/(BV\w+|av\d+)|bangumi/play/(ep\d+|ss\d+))|b23\.tv/([a-zA-Z0-9_-]+)|bili2233\.cn/[a-zA-Z0-9_-]{4,})(?:\?[^\s"<>]+)?"#,
+            r#"(?:https?://)?(?:(?:www\.|m\.)?bilibili\.com/(?:video/(BV\w+|av\d+)|bangumi/play/(ep\d+|ss\d+)|opus/(\d+)|dynamic/(\d+)|read/(?:cv(\d+)|mobile/?\?[^\s"<>]*\bid=(\d+)[^\s"<>]*))|t\.bilibili\.com/(?:h5/dynamic/detail/)?(\d+)|b23\.tv/([a-zA-Z0-9_-]+)|bili2233\.cn/([a-zA-Z0-9_-]{4,}))/?(?:\?[^\s"<>]+)?"#,
         ),
         (
             "douyin",
@@ -129,8 +129,10 @@ pub fn link_type_parser(content: &str) -> Vec<LinkMatch> {
                 continue;
             }
             let id = capture
-                .get(1)
-                .filter(|m| !m.as_str().is_empty())
+                .iter()
+                .skip(1)
+                .flatten()
+                .find(|m| !m.as_str().is_empty())
                 .map_or_else(|| url.clone(), |m| m.as_str().to_string());
             matches.push(LinkMatch {
                 media_type: rule.media_type.into(),
@@ -157,6 +159,23 @@ pub fn clean_url(raw: &str) -> String {
         let _ = url.set_host(Some("www.bilibili.com"));
     }
     if host == "bilibili.com" || host.ends_with(".bilibili.com") {
+        let trimmed_path = url.path().trim_end_matches('/').to_owned();
+        if trimmed_path == "/read/mobile"
+            && let Some(article_id) = url
+                .query_pairs()
+                .find(|(key, value)| {
+                    key == "id" && !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
+                })
+                .map(|(_, value)| value.into_owned())
+        {
+            url.set_path(&format!("/read/cv{article_id}"));
+            url.set_query(None);
+            url.set_fragment(None);
+            return url.to_string();
+        }
+        if !trimmed_path.is_empty() && trimmed_path != url.path() {
+            url.set_path(&trimmed_path);
+        }
         let pairs: Vec<(String, String)> = url
             .query_pairs()
             .filter(|(key, _)| key == "p")
@@ -296,6 +315,41 @@ mod tests {
         assert_eq!(
             clean_url("https://www.bilibili.com/video/BV1?spm_id_from=x"),
             "https://www.bilibili.com/video/BV1"
+        );
+        assert_eq!(
+            clean_url("https://www.bilibili.com/opus/1271940823012868096/?spm_id_from=333"),
+            "https://www.bilibili.com/opus/1271940823012868096"
+        );
+        assert_eq!(
+            clean_url("https://www.bilibili.com/read/mobile?spm=1&id=53711426"),
+            "https://www.bilibili.com/read/cv53711426"
+        );
+    }
+
+    #[test]
+    fn recognizes_bilibili_dynamics_opus_and_read_cv_links() {
+        let text = concat!(
+            "动态1 https://t.bilibili.com/1271940823012868096?tab=2 ",
+            "动态2 https://www.bilibili.com/opus/1265772221318561798/ ",
+            "移动 https://m.bilibili.com/dynamic/1270724202670850065，",
+            "H5 https://t.bilibili.com/h5/dynamic/detail/1270796658725093378 ",
+            "专栏 https://www.bilibili.com/read/cv53711426/ ",
+            "移动专栏 https://m.bilibili.com/read/mobile?spm=1&id=12345 ",
+            "视频 https://m.bilibili.com/video/BV1mpy6ziE1P"
+        );
+        let hits = link_type_parser(text);
+        assert_eq!(hits.len(), 7);
+        assert!(hits.iter().all(|hit| hit.media_type == "bilibili"));
+        assert!(hits.iter().any(|hit| hit.id == "1271940823012868096"));
+        assert!(hits.iter().any(|hit| hit.id == "1265772221318561798"));
+        assert!(hits.iter().any(|hit| hit.id == "1270724202670850065"));
+        assert!(hits.iter().any(|hit| hit.id == "1270796658725093378"));
+        assert!(hits.iter().any(|hit| hit.id == "53711426"));
+        assert!(hits.iter().any(|hit| hit.id == "12345"));
+        assert!(hits.iter().any(|hit| hit.id == "BV1mpy6ziE1P"));
+        assert!(
+            link_type_parser("https://www.bilibili.com/read/mobile").is_empty(),
+            "bare mobile read endpoint without id must not match"
         );
     }
 }

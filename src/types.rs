@@ -425,6 +425,14 @@ impl ParsedData {
     pub fn has_media(&self) -> bool {
         !self.video.is_empty() || !self.images.is_empty()
     }
+
+    pub fn is_text_post(&self) -> bool {
+        self.media_type == "text" && (!self.desc.trim().is_empty() || !self.title.trim().is_empty())
+    }
+
+    pub fn has_deliverable(&self) -> bool {
+        self.has_media() || self.is_text_post()
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

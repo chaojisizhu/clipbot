@@ -1,4 +1,5 @@
 pub mod api;
+mod bilibili_dynamic;
 pub mod cardsearch;
 pub mod channels;
 mod douyin_sign;

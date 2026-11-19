@@ -330,8 +330,10 @@ impl AppState {
                 }
                 continue;
             }
-            let delivered = if matches!(item.media_type.as_str(), "douyin" | "xiaohongshu")
-                && parsed.media_type == "live_photo"
+            let delivered = if matches!(
+                item.media_type.as_str(),
+                "douyin" | "xiaohongshu" | "bilibili"
+            ) && parsed.media_type == "live_photo"
                 && self.config.output.show_video_file
             {
                 self.send_live_album_result(&event, &parsed, &text).await
@@ -812,16 +814,26 @@ impl AppState {
         }
 
         let transfer_succeeded = video_failed_note.is_empty();
+        let is_text_post = parsed.is_text_post();
         let mut delivered = true;
         let mut markdown = build_result_markdown(
             &ParsedData::empty("video"),
             &text,
             &MarkdownOptions {
-                show_image_text: self.config.output.show_image_text,
+                show_image_text: self.config.output.show_image_text || is_text_post,
                 show_cover: false,
                 max_images: 0,
             },
         );
+        if is_text_post && markdown.trim().is_empty() {
+            markdown = if !parsed.title.is_empty() && !parsed.desc.is_empty() {
+                format!("{}\n{}", parsed.title, parsed.desc)
+            } else if !parsed.desc.is_empty() {
+                parsed.desc.clone()
+            } else {
+                parsed.title.clone()
+            };
+        }
         if !video_failed_note.is_empty() {
             markdown.push('\n');
             markdown.push_str(&video_failed_note);
@@ -830,6 +842,8 @@ impl AppState {
             delivered &= self
                 .send_message(event, markdown_payload(markdown, false))
                 .await;
+        } else if is_text_post {
+            delivered = false;
         }
         if !video_file_info.is_empty() {
             delivered &= self
@@ -1105,6 +1119,22 @@ fn concise_user_parse_error(message: &str) -> String {
         .next()
         .unwrap_or(message)
         .trim();
+    if base.contains("此动态为充电会员专属") {
+        return "此动态为充电会员专属，不可访问".into();
+    }
+    if base.contains("源动态已被删除或不可见") {
+        return "源动态已被删除或不可见".into();
+    }
+    if base.contains("该动态已删除或设为不可见") || base.contains("该动态已删除或不可见")
+    {
+        return "该动态已被删除或不可见".into();
+    }
+    if base.contains("仅自己可见或已被删除")
+        || base.contains("动态可能不存在")
+        || base.contains("专栏不存在或已被删除")
+    {
+        return "该动态或专栏不存在、仅自己可见或已被删除".into();
+    }
     if base.contains("纯文字") {
         return "该帖子为纯文字内容，不包含视频或图片".into();
     }
@@ -1148,8 +1178,8 @@ fn concise_user_parse_error(message: &str) -> String {
     {
         return "微信视频号解析登录态已失效，请联系管理员更新".into();
     }
-    if base.contains("缺少BV、av、ep或ss标识") {
-        return "该链接不是可解析的 B站视频地址".into();
+    if base.contains("缺少BV、av、ep") {
+        return "该链接不是可解析的 B站作品、动态或专栏地址".into();
     }
     if base.contains("Cookie") || base.contains("登录") {
         return "该作品需要登录态或访问权限，暂无法提取".into();
@@ -1296,6 +1326,18 @@ mod tests {
     #[test]
     fn maps_non_bug_failures_to_concise_group_notices() {
         assert_eq!(
+            concise_user_parse_error("此动态为充电会员专属，不可访问"),
+            "此动态为充电会员专属，不可访问"
+        );
+        assert_eq!(
+            concise_user_parse_error("源动态已被删除或不可见"),
+            "源动态已被删除或不可见"
+        );
+        assert_eq!(
+            concise_user_parse_error("B站原站返回 4101131，动态不存在、仅自己可见或已被删除"),
+            "该动态或专栏不存在、仅自己可见或已被删除"
+        );
+        assert_eq!(
             concise_user_parse_error("该 X 帖子为纯文字内容，不包含视频或图片"),
             "该帖子为纯文字内容，不包含视频或图片"
         );
@@ -1359,5 +1401,74 @@ mod tests {
             concise_gallery_api_error_note(3, &QQApiError::new(40034141, "转存失败", None)),
             "⚠️ 图集发送失败，本次 3 张图片未发送，请稍后重试。（QQ 错误码 40034141）"
         );
+    }
+
+    #[tokio::test]
+    async fn send_media_result_delivers_text_only_posts_as_markdown_even_when_show_image_text_disabled()
+     {
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = Arc::clone(&sent);
+        let app = Router::new()
+            .route(
+                "/app/getAppAccessToken",
+                post(|| async { Json(json!({"access_token":"TEXT_TOKEN","expires_in":7200})) }),
+            )
+            .route(
+                "/v2/groups/{group}/messages",
+                post(move |Json(body): Json<Value>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured.lock().await.push(body);
+                        Json(json!({"id":"sent-text-1"}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = AppConfig::default();
+        config.qqbot.app_id = "app".into();
+        config.qqbot.app_secret = "secret".into();
+        config.qqbot.api_base = base;
+        config.output.show_image_text = false;
+        let config = Arc::new(config);
+        let app_state = AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        );
+
+        let mut parsed = ParsedData::empty("text");
+        parsed.author = "陈睿".into();
+        parsed.desc = "就在今天！\n我们是冠军！！！".into();
+        parsed.like = 38000;
+        let formatted = generate_formatted_text(&parsed, &config.output.format);
+        let event = QQChatEvent {
+            chat_type: ChatType::Group,
+            chat_id: "GROUP_TEXT".into(),
+            message_id: "MSG_TEXT_1".into(),
+            ..QQChatEvent::default()
+        };
+
+        assert!(app_state.send_media_result(&event, parsed, formatted).await);
+        let messages = sent.lock().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["msg_type"], 2);
+        assert!(
+            messages[0]["markdown"]
+                .get("force_verify_image_resource")
+                .is_none()
+        );
+        let md = messages[0]["markdown"]["content"].as_str().unwrap();
+        assert!(md.contains("作者：陈睿"));
+        assert!(md.contains("就在今天！\n我们是冠军！！！"));
+        assert!(md.contains("点赞：38000"));
+        server.abort();
     }
 }

@@ -51,20 +51,20 @@ pub async fn parse(http: &SiteHttp, url: &str, platform: &str) -> Result<ParsedD
     Ok(parsed)
 }
 
-fn headers(referer: &str) -> Result<HeaderMap> {
+pub(super) fn headers(referer: &str) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     headers.insert(REFERER, HeaderValue::from_str(referer)?);
     Ok(headers)
 }
 
-fn endpoint(base: &str, pairs: &[(&str, String)]) -> Result<String> {
+pub(super) fn endpoint(base: &str, pairs: &[(&str, String)]) -> Result<String> {
     let mut url = Url::parse(base)?;
     url.query_pairs_mut()
         .extend_pairs(pairs.iter().map(|(key, value)| (*key, value)));
     Ok(url.into())
 }
 
-fn text(value: &Value, pointer: &str) -> String {
+pub(super) fn text(value: &Value, pointer: &str) -> String {
     match value.pointer(pointer) {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Number(number)) => number.to_string(),
@@ -72,7 +72,7 @@ fn text(value: &Value, pointer: &str) -> String {
     }
 }
 
-fn number(value: &Value, pointer: &str) -> i64 {
+pub(super) fn number(value: &Value, pointer: &str) -> i64 {
     let Some(value) = value.pointer(pointer) else {
         return 0;
     };
@@ -94,7 +94,7 @@ fn duration(value: &Value, pointer: &str) -> u64 {
         .max(0.0) as u64
 }
 
-fn media_url(raw: &str) -> Option<String> {
+pub(super) fn media_url(raw: &str) -> Option<String> {
     let raw = raw.replace("&amp;", "&");
     let normalized = if raw.starts_with("//") {
         format!("https:{raw}")
@@ -103,6 +103,14 @@ fn media_url(raw: &str) -> Option<String> {
     };
     let url = Url::parse(&normalized).ok()?;
     matches!(url.scheme(), "http" | "https").then_some(normalized)
+}
+
+pub(super) fn https_media_url(raw: &str) -> Option<String> {
+    let mut url = Url::parse(&media_url(raw)?).ok()?;
+    if url.scheme() == "http" {
+        let _ = url.set_scheme("https");
+    }
+    Some(url.into())
 }
 
 fn progressive_url(raw: &str) -> Option<String> {
@@ -170,17 +178,32 @@ fn bili_page(url: &Url) -> Result<usize> {
 
 async fn parse_bilibili(http: &SiteHttp, input: &str) -> Result<ParsedData> {
     let url = Url::parse(input)?;
-    let id = BILI_ID
+    if let Some(id) = BILI_ID
         .captures(url.path())
         .and_then(|capture| capture.get(1))
-        .context("B站链接缺少BV、av、ep或ss标识")?
-        .as_str();
-    if id.starts_with("ep") || id.starts_with("ss") {
-        return parse_bangumi(http, id).await;
+        .map(|found| found.as_str().to_owned())
+    {
+        if id.starts_with("ep") || id.starts_with("ss") {
+            return parse_bangumi(http, &id).await;
+        }
+        let part = bili_page(&url)?;
+        return parse_bilibili_video_by_id(http, &id, part).await;
     }
-    let part = bili_page(&url)?;
+    if let Some(parsed) = super::bilibili_dynamic::parse_bilibili_post(http, &url).await? {
+        return Ok(parsed);
+    }
+    bail!("B站链接缺少BV、av、ep、ss、动态或专栏标识")
+}
+
+pub(super) async fn parse_bilibili_video_by_id(
+    http: &SiteHttp,
+    id: &str,
+    part: usize,
+) -> Result<ParsedData> {
     let identity = if let Some(aid) = id.strip_prefix("av") {
         ("aid", aid.to_owned())
+    } else if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+        ("aid", id.to_owned())
     } else {
         ("bvid", id.to_owned())
     };
@@ -483,7 +506,7 @@ fn bangumi_episode<'a>(season: &'a Value, id: &str) -> Result<&'a Value> {
         .context("B站番剧暂无可播放集数")
 }
 
-async fn parse_bangumi(http: &SiteHttp, id: &str) -> Result<ParsedData> {
+pub(super) async fn parse_bangumi(http: &SiteHttp, id: &str) -> Result<ParsedData> {
     let param = if let Some(episode) = id.strip_prefix("ep") {
         ("ep_id", episode.to_owned())
     } else {
@@ -612,7 +635,7 @@ async fn parse_weibo(http: &SiteHttp, input: &str) -> Result<ParsedData> {
     map_weibo(response.get("data").context("微博响应缺少正文")?)
 }
 
-fn clean_html(raw: &str) -> String {
+pub(super) fn clean_html(raw: &str) -> String {
     HTML_TAG
         .replace_all(raw, "")
         .replace("&nbsp;", " ")

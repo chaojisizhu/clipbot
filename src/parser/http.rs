@@ -323,6 +323,13 @@ impl SiteHttp {
         ))
     }
 
+    pub(super) fn has_platform_cookie(&self, raw_url: &str, platform: &str) -> bool {
+        validate_site_url(raw_url, platform)
+            .ok()
+            .and_then(|url| self.cookie_header(&url, platform).ok().flatten())
+            .is_some()
+    }
+
     /// Reads a selected session value from the same domain/path/expiry filtered
     /// Cookie header that will accompany the original-site request.
     pub(super) fn session_cookie(
@@ -388,7 +395,9 @@ impl SiteHttp {
                     request =
                         request.header(REFERER, format!("{}/", url.origin().ascii_serialization()));
                 }
-                if let Some(cookie) = self.cookie_header(&url, platform)? {
+                if !options.headers.contains_key(COOKIE)
+                    && let Some(cookie) = self.cookie_header(&url, platform)?
+                {
                     request = request.header(COOKIE, cookie);
                 }
                 if request_method == Method::POST {
@@ -518,14 +527,19 @@ impl SiteHttp {
         Ok(response.url().to_string())
     }
 
-    pub(super) async fn resolve_douyin_short(&self, url: &str) -> Result<String> {
+    async fn resolve_until(
+        &self,
+        url: &str,
+        platform: &str,
+        stop_at: fn(&Url) -> bool,
+    ) -> Result<String> {
         let result = self
             .request(
                 Method::GET,
                 url,
-                "douyin",
+                platform,
                 RequestOptions {
-                    stop_at: Some(|url| super::sites_page::douyin_path_id(url).is_some()),
+                    stop_at: Some(stop_at),
                     ..RequestOptions::default()
                 },
             )
@@ -536,27 +550,28 @@ impl SiteHttp {
         })
     }
 
-    pub(super) async fn resolve_xhs_short(&self, url: &str) -> Result<String> {
-        let result = self
-            .request(
-                Method::GET,
-                url,
-                "xiaohongshu",
-                RequestOptions {
-                    stop_at: Some(|url| {
-                        url.host_str().is_some_and(|host| {
-                            domain_matches(host, "xiaohongshu.com")
-                                || domain_matches(host, "rednote.com")
-                        })
-                    }),
-                    ..RequestOptions::default()
-                },
-            )
-            .await?;
-        Ok(match result {
-            SiteResponse::Final(response) => response.url().to_string(),
-            SiteResponse::RedirectTarget(target) => target.into(),
+    pub(super) async fn resolve_bilibili_short(&self, url: &str) -> Result<String> {
+        self.resolve_until(url, "bilibili", |url| {
+            url.host_str()
+                .is_some_and(|host| domain_matches(host, "bilibili.com"))
         })
+        .await
+    }
+
+    pub(super) async fn resolve_douyin_short(&self, url: &str) -> Result<String> {
+        self.resolve_until(url, "douyin", |url| {
+            super::sites_page::douyin_path_id(url).is_some()
+        })
+        .await
+    }
+
+    pub(super) async fn resolve_xhs_short(&self, url: &str) -> Result<String> {
+        self.resolve_until(url, "xiaohongshu", |url| {
+            url.host_str().is_some_and(|host| {
+                domain_matches(host, "xiaohongshu.com") || domain_matches(host, "rednote.com")
+            })
+        })
+        .await
     }
 
     pub async fn get_text(&self, url: &str, platform: &str) -> Result<String> {

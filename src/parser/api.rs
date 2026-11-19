@@ -232,14 +232,15 @@ impl VideoParserService {
                 return Err(error);
             }
         };
-        if !data.has_media() && data.attachment.is_none() {
+        if !data.has_deliverable() && data.attachment.is_none() {
             bail!("{platform} 未找到可用媒体，请补充登录 Cookie 或检查链接访问权限");
         }
-        data.desc = data
-            .desc
-            .chars()
-            .take(self.config.output.max_desc_length.min(16_384))
-            .collect();
+        let desc_limit = if data.is_text_post() {
+            self.config.output.max_desc_length.clamp(2000, 4000)
+        } else {
+            self.config.output.max_desc_length.min(16_384)
+        };
+        data.desc = data.desc.chars().take(desc_limit).collect();
         if data.media_headers.is_empty()
             && let Ok(url) = Url::parse(url)
         {
@@ -295,6 +296,8 @@ impl VideoParserService {
         }
         let resolved = if platform == "xiaohongshu" && is_short_link(url) {
             self.http.resolve_xhs_short(url).await?
+        } else if platform == "bilibili" && is_short_link(url) {
+            self.http.resolve_bilibili_short(url).await?
         } else if platform != "douyin" && is_short_link(url) {
             self.http.resolve_url(url, platform).await?
         } else {
@@ -328,10 +331,7 @@ impl VideoParserService {
                 || error.is::<DouyinMediaUnavailable>()
                 || error.is::<XhsMediaUnavailable>()
                 || error.is::<BilibiliMediaUnavailable>()
-                || matches!(
-                    error.downcast_ref::<TwitterMediaUnavailable>(),
-                    Some(TwitterMediaUnavailable::TextOnly)
-                )
+                || error.is::<TwitterMediaUnavailable>()
                 || platform == "douyin"
                     && (error.is::<SiteJsonUnavailable>()
                         || sites_page::douyin_slides_id(resolved).is_some())
@@ -358,7 +358,7 @@ impl VideoParserService {
             }
         }
         match native {
-            Ok(data) if data.has_media() => Ok(data),
+            Ok(data) if data.has_deliverable() => Ok(data),
             native_result if self.config.ytdlp.enabled => {
                 let native_error = native_result
                     .err()
@@ -481,6 +481,11 @@ fn is_short_link(raw: &str) -> bool {
 }
 
 fn parse_cache_key(url: &str, platform: &str) -> String {
+    if platform == "bilibili"
+        && let Some(key) = crate::parser::bilibili_dynamic::extract_bilibili_cache_identity(url)
+    {
+        return key;
+    }
     if platform == "douyin"
         && let Some(id) = sites_page::douyin_slides_id(url)
     {
@@ -676,6 +681,32 @@ exit 1"#,
         assert_eq!(
             std::fs::read_to_string(directory.path().join("calls")).unwrap(),
             "run"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_native_accepts_text_posts_without_ytdlp_and_shares_dynamic_cache_key() {
+        let mut config = AppConfig::default();
+        config.ytdlp.enabled = true;
+        let service = VideoParserService::new(config).unwrap();
+
+        let mut text_post = ParsedData::empty("text");
+        text_post.author = "测试用户".into();
+        text_post.desc = "纯文字正文内容".into();
+        let accepted = service
+            .complete_native(Ok(text_post), "https://t.bilibili.com/123456", "bilibili")
+            .await
+            .unwrap();
+        assert_eq!(accepted.media_type, "text");
+        assert!(accepted.has_deliverable());
+
+        assert_eq!(
+            parse_cache_key("https://t.bilibili.com/123456?spm=1", "bilibili"),
+            parse_cache_key("https://www.bilibili.com/opus/123456/", "bilibili")
+        );
+        assert_eq!(
+            parse_cache_key("https://www.bilibili.com/opus/123456", "bilibili"),
+            parse_cache_key("https://m.bilibili.com/dynamic/123456", "bilibili")
         );
     }
 

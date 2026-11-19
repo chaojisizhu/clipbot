@@ -323,8 +323,9 @@ fn parse_created_at(value: Option<&Value>) -> i64 {
     value
         .and_then(Value::as_str)
         .and_then(|raw| {
-            DateTime::parse_from_rfc2822(raw)
+            DateTime::parse_from_rfc3339(raw)
                 .ok()
+                .or_else(|| DateTime::parse_from_rfc2822(raw).ok())
                 .or_else(|| DateTime::parse_from_str(raw, "%a %b %d %H:%M:%S %z %Y").ok())
                 .or_else(|| {
                     let without_weekday = raw.split_once(' ').map(|(_, rest)| rest).unwrap_or(raw);
@@ -333,6 +334,63 @@ fn parse_created_at(value: Option<&Value>) -> i64 {
         })
         .map(|date| date.timestamp_millis())
         .unwrap_or(0)
+}
+
+fn extract_syndication_text(data: &Value) -> String {
+    data.pointer("/note_tweet/note_tweet_results/result/text")
+        .or_else(|| data.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn extract_quoted_tweet_text(data: &Value) -> Option<String> {
+    let quoted = data.get("quoted_tweet")?;
+    let q_text = extract_syndication_text(quoted);
+    if q_text.is_empty() {
+        return None;
+    }
+    let author = quoted
+        .pointer("/user/screen_name")
+        .or_else(|| quoted.pointer("/user/name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if author.is_empty() {
+        Some(format!("引用推文：\n{q_text}"))
+    } else {
+        Some(format!("引用 @{author}：\n{q_text}"))
+    }
+}
+
+fn populate_syndication_metadata(parsed: &mut ParsedData, data: &Value) {
+    parsed.desc = extract_syndication_text(data);
+    parsed.author = data
+        .pointer("/user/name")
+        .or_else(|| data.pointer("/user/screen_name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    parsed.uid = data
+        .pointer("/user/screen_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    parsed.avatar = data
+        .pointer("/user/profile_image_url_https")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    parsed.like = data
+        .get("favorite_count")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    parsed.comment = data
+        .get("conversation_count")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    parsed.publish_time = parse_created_at(data.get("created_at"));
 }
 
 pub fn map_syndication(data: &Value) -> ParsedData {
@@ -380,28 +438,7 @@ pub fn map_syndication(data: &Value) -> ParsedData {
         });
         if !variants.is_empty() {
             let mut parsed = ParsedData::empty("video");
-            parsed.desc = data
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            parsed.author = data
-                .pointer("/user/name")
-                .or_else(|| data.pointer("/user/screen_name"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            parsed.uid = data
-                .pointer("/user/screen_name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            parsed.avatar = data
-                .pointer("/user/profile_image_url_https")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            populate_syndication_metadata(&mut parsed, data);
             parsed.cover = videos[0]
                 .get("media_url_https")
                 .and_then(Value::as_str)
@@ -429,11 +466,6 @@ pub fn map_syndication(data: &Value) -> ParsedData {
                     bit_rate: variant.get("bitrate").and_then(Value::as_u64),
                 })
                 .collect();
-            parsed.like = data
-                .get("favorite_count")
-                .and_then(Value::as_i64)
-                .unwrap_or(0);
-            parsed.publish_time = parse_created_at(data.get("created_at"));
             parsed.duration = videos[0]
                 .pointer("/video_info/duration_millis")
                 .and_then(Value::as_u64)
@@ -446,28 +478,7 @@ pub fn map_syndication(data: &Value) -> ParsedData {
 
     if !photos.is_empty() {
         let mut parsed = ParsedData::empty("image");
-        parsed.desc = data
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        parsed.author = data
-            .pointer("/user/name")
-            .or_else(|| data.pointer("/user/screen_name"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        parsed.uid = data
-            .pointer("/user/screen_name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        parsed.avatar = data
-            .pointer("/user/profile_image_url_https")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        populate_syndication_metadata(&mut parsed, data);
         let mut seen = HashSet::new();
         let mut size_map = std::collections::HashMap::new();
         for photo in photos {
@@ -485,81 +496,31 @@ pub fn map_syndication(data: &Value) -> ParsedData {
         parsed.cover = parsed.images.first().cloned().unwrap_or_default();
         parsed.cover_size = size_map.get(&parsed.cover).cloned();
         parsed.image_size_map = Some(size_map);
-        parsed.like = data
-            .get("favorite_count")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        parsed.publish_time = parse_created_at(data.get("created_at"));
         return parsed;
     }
 
-    let mut parsed = ParsedData::empty("image");
-    parsed.desc = data
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    parsed.author = data
-        .pointer("/user/name")
-        .or_else(|| data.pointer("/user/screen_name"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    parsed.uid = data
-        .pointer("/user/screen_name")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    parsed.avatar = data
-        .pointer("/user/profile_image_url_https")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    parsed.like = data
-        .get("favorite_count")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    parsed.publish_time = parse_created_at(data.get("created_at"));
+    let mut parsed = ParsedData::empty("text");
+    populate_syndication_metadata(&mut parsed, data);
+    if let Some(quoted) = extract_quoted_tweet_text(data) {
+        if parsed.desc.is_empty() {
+            parsed.desc = quoted;
+        } else {
+            parsed.desc = format!("{}\n\n{quoted}", parsed.desc);
+        }
+    }
     parsed
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TwitterMediaUnavailable {
-    TextOnly,
-    Unavailable,
-}
+pub(super) struct TwitterMediaUnavailable;
 
 impl std::fmt::Display for TwitterMediaUnavailable {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::TextOnly => formatter.write_str("该 X 帖子为纯文字内容，不包含视频或图片"),
-            Self::Unavailable => {
-                formatter.write_str("X 未返回公开媒体（原帖可能已删除、设私或受年龄/登录限制）")
-            }
-        }
+        formatter.write_str("X 未返回公开媒体（原帖可能已删除、设私或受年龄/登录限制）")
     }
 }
 
 impl std::error::Error for TwitterMediaUnavailable {}
-
-fn classify_empty_syndication(data: &Value) -> TwitterMediaUnavailable {
-    let is_tombstone = data.get("__typename").and_then(Value::as_str) == Some("TweetTombstone")
-        || data.get("tombstone").is_some();
-    let has_tweet_content = data
-        .get("id_str")
-        .and_then(Value::as_str)
-        .is_some_and(|id| !id.is_empty())
-        || data
-            .get("text")
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.trim().is_empty());
-    if !is_tombstone && has_tweet_content {
-        TwitterMediaUnavailable::TextOnly
-    } else {
-        TwitterMediaUnavailable::Unavailable
-    }
-}
 
 pub async fn parse_native(http: &SiteHttp, url: &str) -> anyhow::Result<ParsedData> {
     let status_id =
@@ -568,8 +529,10 @@ pub async fn parse_native(http: &SiteHttp, url: &str) -> anyhow::Result<ParsedDa
         format!("https://cdn.syndication.twimg.com/tweet-result?id={status_id}&token=x&lang=en");
     let data = http.get_json(&endpoint, "twitter").await?;
     let parsed = map_syndication(&data);
-    if !parsed.has_media() {
-        return Err(classify_empty_syndication(&data).into());
+    let is_tombstone = data.get("__typename").and_then(Value::as_str) == Some("TweetTombstone")
+        || data.get("tombstone").is_some();
+    if is_tombstone || !parsed.has_deliverable() {
+        return Err(TwitterMediaUnavailable.into());
     }
     Ok(parsed)
 }
@@ -725,29 +688,37 @@ mod tests {
     }
 
     #[test]
-    fn classifies_text_only_and_tombstone_tweets() {
+    fn maps_text_only_and_rejects_tombstone_tweets() {
         let text_only = serde_json::json!({
             "__typename": "Tweet",
             "id_str": "2122240158502437045",
             "text": "纯文字长推文",
-            "user": { "name": "Dzy" }
+            "created_at": "2006-03-21T20:50:14.000Z",
+            "conversation_count": 12,
+            "favorite_count": 88,
+            "user": { "name": "Dzy", "screen_name": "dzy_test" },
+            "quoted_tweet": {
+                "text": "被引用的推文正文",
+                "user": { "screen_name": "quoted_user" }
+            }
         });
+        let parsed = map_syndication(&text_only);
+        assert_eq!(parsed.media_type, "text");
+        assert!(parsed.has_deliverable());
+        assert!(!parsed.has_media());
+        assert_eq!(parsed.publish_time, 1_142_974_214_000);
+        assert_eq!(parsed.comment, 12);
+        assert_eq!(parsed.like, 88);
         assert_eq!(
-            classify_empty_syndication(&text_only),
-            TwitterMediaUnavailable::TextOnly
+            parsed.desc,
+            "纯文字长推文\n\n引用 @quoted_user：\n被引用的推文正文"
         );
 
         let tombstone = serde_json::json!({
             "__typename": "TweetTombstone",
             "tombstone": { "text": { "text": "Age-restricted" } }
         });
-        assert_eq!(
-            classify_empty_syndication(&tombstone),
-            TwitterMediaUnavailable::Unavailable
-        );
-        assert_eq!(
-            classify_empty_syndication(&serde_json::json!({})),
-            TwitterMediaUnavailable::Unavailable
-        );
+        assert!(!map_syndication(&tombstone).has_deliverable());
+        assert!(!map_syndication(&serde_json::json!({})).has_deliverable());
     }
 }

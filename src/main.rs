@@ -96,8 +96,10 @@ async fn run() -> Result<()> {
                 if command == "probe" {
                     match &result {
                         ParseResult::Success(data)
-                            if hit.media_type == "douyin"
-                                && data.media_type == "live_photo"
+                            if matches!(
+                                hit.media_type.as_str(),
+                                "douyin" | "xiaohongshu" | "bilibili"
+                            ) && data.media_type == "live_photo"
                                 && !data.live_photo.is_empty() =>
                         {
                             let file = download_live_album_temp(data, &config).await?;
@@ -112,6 +114,10 @@ async fn run() -> Result<()> {
                                 })
                             );
                         }
+                        ParseResult::Success(data) if data.is_text_post() => println!(
+                            "{}",
+                            serde_json::json!({"status":"success", "platform":hit.media_type, "type":"text", "title":data.title, "textChars":data.desc.chars().count()})
+                        ),
                         ParseResult::Success(data) if !data.video.is_empty() => {
                             let file = download_parsed_temp(data, &config).await?;
                             println!(
