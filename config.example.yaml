@@ -59,10 +59,11 @@ channels:
   enabled: true
   yuanbaoCookie: ""
 
-# 可选本机提取器，默认关闭。启用后仅在原生规则缺失时调用本机进程。
+# 可选本机提取器，默认关闭。X 登录态视频使用 yt-dlp，按需使用 gallery-dl 补充单帖详情。
 ytdlp:
   enabled: false
   command: "yt-dlp"
+  xDetailsCommand: "gallery-dl"
   timeout: 90000
   proxy: ""
   cookieFile: ""

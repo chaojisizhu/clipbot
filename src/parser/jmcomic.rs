@@ -109,6 +109,20 @@ fn seven_zip_command() -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn jm_process_error(error: ProcessError) -> anyhow::Error {
+    if let ProcessError::Failed(detail) = &error
+        && let Some((_, module)) = detail.rsplit_once("JM_ERR missing_dependency ")
+        && !module.is_empty()
+        && module.len() <= 64
+        && module
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+    {
+        return anyhow::anyhow!("JM 缺少 Python 依赖 {module}");
+    }
+    error.into()
+}
+
 async fn run_download(
     python: &str,
     id: &str,
@@ -141,13 +155,13 @@ async fn run_download(
         })
     };
     let output = match spawn_capture_in_monitored(python, &args, timeout, None, budget()).await {
-        Ok(output) => output,
         Err(ProcessError::NotFound(err)) if python == "python" => {
             warn!("python 不可用，回退 python3: {err}");
-            spawn_capture_in_monitored("python3", &args, timeout, None, budget()).await?
+            spawn_capture_in_monitored("python3", &args, timeout, None, budget()).await
         }
-        Err(err) => return Err(err.into()),
-    };
+        result => result,
+    }
+    .map_err(jm_process_error)?;
     if !output.lines().any(|line| line.starts_with("JM_OK")) {
         anyhow::bail!(
             "下载脚本未返回 JM_OK: {}",
@@ -488,6 +502,27 @@ mod tests {
         assert_eq!(extract_jm_id("解析jm的来了"), None);
         assert_eq!(extract_jm_id("看看这个 jm 350234"), None);
         assert_eq!(extract_jm_id("jm abc"), None);
+    }
+
+    #[test]
+    fn reads_missing_dependency_from_script_diagnostics() {
+        let error = ProcessError::Failed("warning JM_ERR missing_dependency requests".into());
+        assert_eq!(
+            jm_process_error(error).to_string(),
+            "JM 缺少 Python 依赖 requests"
+        );
+
+        let error = ProcessError::Failed("JM_ERR missing_dependency Crypto.Cipher".into());
+        assert_eq!(
+            jm_process_error(error).to_string(),
+            "JM 缺少 Python 依赖 Crypto.Cipher"
+        );
+
+        let error = ProcessError::Failed("JM_ERR 下载失败: 请求超时".into());
+        assert_eq!(
+            jm_process_error(error).to_string(),
+            "JM_ERR 下载失败: 请求超时"
+        );
     }
 
     #[test]

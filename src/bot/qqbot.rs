@@ -23,6 +23,7 @@ use crate::types::{BotEvent, ChatType, QQApiError, QQBotConfig, QQChatEvent, QQM
 
 pub const INTENT_GROUP_AND_C2C: u64 = 1 << 25;
 const PASSIVE_FALLBACK_CODES: &[i64] = &[40_034_128, 40_034_005, 40_034_026, 304_027];
+const QQ_MAX_PASSIVE_REPLIES: u64 = 5;
 const DUPLICATE_SEQ_CODE: i64 = 40_054_005;
 const UPLOAD_BUFFER_SIZE: usize = 64 * 1024;
 const MAX_FILE_UPLOAD_CONCURRENCY: u64 = 2;
@@ -1375,7 +1376,7 @@ impl QQBotClient {
         .await
     }
 
-    async fn next_seq(&self, message_id: &str) -> u64 {
+    async fn next_seq(&self, message_id: &str, passive_only: bool) -> Result<u64, QQBotError> {
         let mut guard = self.reply_seqs.lock().await;
         let now = Instant::now();
         if guard.len() >= 4096 && !guard.contains_key(message_id) {
@@ -1392,12 +1393,43 @@ impl QQBotClient {
             }
         }
         let (sequence, last_used) = guard.entry(message_id.to_string()).or_insert((0, now));
+        if passive_only && *sequence >= QQ_MAX_PASSIVE_REPLIES {
+            return Err(QQBotError::Other("QQ 被动回复额度已用完".into()));
+        }
         *sequence += 1;
         *last_used = now;
-        *sequence
+        Ok(*sequence)
+    }
+
+    pub(crate) async fn remaining_passive_replies(&self, event: &QQChatEvent) -> usize {
+        // QQ 单聊、群聊的同一条入站消息最多被动回复五次。
+        let used = self
+            .reply_seqs
+            .lock()
+            .await
+            .get(&event.message_id)
+            .map_or(0, |(sequence, _)| *sequence);
+        QQ_MAX_PASSIVE_REPLIES.saturating_sub(used) as usize
     }
 
     pub async fn reply(&self, event: &QQChatEvent, body: &Value) -> Result<Value, QQBotError> {
+        self.reply_with_fallback(event, body, true).await
+    }
+
+    pub(crate) async fn reply_passive(
+        &self,
+        event: &QQChatEvent,
+        body: &Value,
+    ) -> Result<Value, QQBotError> {
+        self.reply_with_fallback(event, body, false).await
+    }
+
+    async fn reply_with_fallback(
+        &self,
+        event: &QQChatEvent,
+        body: &Value,
+        allow_active_fallback: bool,
+    ) -> Result<Value, QQBotError> {
         let mut passive = body
             .as_object()
             .cloned()
@@ -1405,7 +1437,10 @@ impl QQBotClient {
         passive.insert("msg_id".into(), Value::String(event.message_id.clone()));
         passive.insert(
             "msg_seq".into(),
-            json!(self.next_seq(&event.message_id).await),
+            json!(
+                self.next_seq(&event.message_id, !allow_active_fallback)
+                    .await?
+            ),
         );
         let passive = Value::Object(passive);
         let result = match event.chat_type {
@@ -1414,7 +1449,9 @@ impl QQBotClient {
         };
         match result {
             Ok(result) => Ok(result),
-            Err(QQBotError::Api(error)) if PASSIVE_FALLBACK_CODES.contains(&error.err_code) => {
+            Err(QQBotError::Api(error))
+                if allow_active_fallback && PASSIVE_FALLBACK_CODES.contains(&error.err_code) =>
+            {
                 warn!("被动回复受限，转主动消息发送: {error}");
                 let mut active = body.as_object().cloned().unwrap_or_default();
                 active.remove("msg_id");
@@ -1431,7 +1468,10 @@ impl QQBotClient {
                 retried.insert("msg_id".into(), Value::String(event.message_id.clone()));
                 retried.insert(
                     "msg_seq".into(),
-                    json!(self.next_seq(&event.message_id).await),
+                    json!(
+                        self.next_seq(&event.message_id, !allow_active_fallback)
+                            .await?
+                    ),
                 );
                 let retried = Value::Object(retried);
                 match event.chat_type {

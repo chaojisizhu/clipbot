@@ -5,6 +5,7 @@
 import argparse
 import os
 import sys
+from importlib import import_module
 from threading import Lock
 
 
@@ -47,16 +48,21 @@ def main():
     out_dir = os.path.abspath(args.out_dir)
 
     try:
-        import jmcomic
+        import_module("requests")
+        jmcomic = import_module("jmcomic")
+        import_module("Crypto.Cipher.AES")
+    except ModuleNotFoundError as error:
+        print(f"JM_ERR missing_dependency {error.name}", file=sys.stderr)
+        sys.exit(3)
     except ImportError:
-        print("JM_ERR 未安装 jmcomic 库，请先执行: pip install jmcomic", file=sys.stderr)
+        print("JM_ERR Python 依赖无法导入，请检查服务使用的虚拟环境", file=sys.stderr)
         sys.exit(3)
 
     os.makedirs(out_dir, exist_ok=True)
 
-    postman = {"timeout": 20, "type": "requests"}
+    request_options = {"timeout": 20}
     if args.proxy:
-        postman["proxies"] = {"http": args.proxy, "https": args.proxy}
+        request_options["proxies"] = {"http": args.proxy, "https": args.proxy}
 
     threads_image = max(1, min(32, args.threads))
 
@@ -65,7 +71,7 @@ def main():
         "dir_rule": {"base_dir": out_dir, "rule": "Bd/Pindex"},
         "client": {
             "impl": "api",
-            "postman": postman,
+            "postman": {"type": "requests", "meta_data": request_options},
         },
         "download": {
             "cache": True,

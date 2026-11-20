@@ -171,6 +171,7 @@ impl Default for OutputConfig {
 pub struct YtdlpConfig {
     pub enabled: bool,
     pub command: String,
+    pub x_details_command: String,
     pub proxy: String,
     pub timeout: u64,
     pub cookie_file: String,
@@ -181,6 +182,7 @@ impl Default for YtdlpConfig {
         Self {
             enabled: false,
             command: "yt-dlp".into(),
+            x_details_command: "gallery-dl".into(),
             proxy: std::env::var("http_proxy")
                 .or_else(|_| std::env::var("HTTP_PROXY"))
                 .unwrap_or_default(),
@@ -388,6 +390,12 @@ pub struct ParsedData {
     pub media_type: String,
     pub title: String,
     pub desc: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub post_body: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub post_body_is_preview: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_post_url: String,
     pub author: String,
     pub uid: String,
     pub avatar: String,
@@ -431,7 +439,10 @@ impl ParsedData {
     }
 
     pub fn is_text_post(&self) -> bool {
-        self.media_type == "text" && (!self.desc.trim().is_empty() || !self.title.trim().is_empty())
+        self.media_type == "text"
+            && (!self.post_body.trim().is_empty()
+                || !self.desc.trim().is_empty()
+                || !self.title.trim().is_empty())
     }
 
     pub fn has_deliverable(&self) -> bool {

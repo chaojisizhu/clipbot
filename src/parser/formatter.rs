@@ -41,10 +41,15 @@ pub fn generate_formatted_text(data: &ParsedData, format: &str) -> String {
     } else {
         data.live_photo.len()
     };
+    let description = if data.post_body.is_empty() {
+        &data.desc
+    } else {
+        &data.post_body
+    };
     let vars: HashMap<&str, String> = HashMap::from([
         ("标题", data.title.clone()),
         ("作者", data.author.clone()),
-        ("简介", data.desc.clone()),
+        ("简介", description.clone()),
         ("视频时长", format_duration(data.duration)),
         ("点赞数", data.like.to_string()),
         ("收藏数", data.collect.to_string()),
@@ -79,7 +84,10 @@ pub fn generate_formatted_text(data: &ParsedData, format: &str) -> String {
         }
         let mut rendered = line.to_string();
         for (key, value) in &vars {
-            rendered = rendered.replace(&format!("${{{key}}}"), value);
+            let variable = format!("${{{key}}}");
+            if rendered.contains(&variable) {
+                rendered = rendered.replace(&variable, value);
+            }
         }
         result.push(rendered);
     }

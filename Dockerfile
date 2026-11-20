@@ -61,16 +61,17 @@ COPY --from=ffmpeg-build /ffmpeg/COPYING.GPLv3 /usr/share/licenses/ffmpeg/COPYIN
 
 FROM debian:bookworm-slim AS extras
 USER root
+COPY scripts/requirements-extras.txt /tmp/requirements-extras.txt
 RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv ca-certificates \
     && python3 -m venv /opt/extras \
-    && /opt/extras/bin/pip install --no-cache-dir yt-dlp jmcomic \
+    && /opt/extras/bin/pip install --no-cache-dir -r /tmp/requirements-extras.txt \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=media /usr/local/bin/ /usr/local/bin/
 WORKDIR /app
 COPY --chown=65532:65532 config.example.yaml ./config.example.yaml
 RUN mkdir -p /app/temp_videos /app/temp_jm && chown -R 65532:65532 /app
 ENV PATH="/opt/extras/bin:${PATH}"
-COPY scripts ./scripts
+COPY scripts/jm_download.py ./scripts/jm_download.py
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/clipbot"]
 CMD ["bot"]

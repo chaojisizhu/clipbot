@@ -96,7 +96,8 @@ impl VideoParserService {
 
     fn cache_result(&self, key: String, data: &ParsedData) {
         if data.attachment.is_none() {
-            self.cache_value(key, CacheValue::Media(Box::new(data.clone())), 300);
+            let max_age = if data.post_body_is_preview { 30 } else { 300 };
+            self.cache_value(key, CacheValue::Media(Box::new(data.clone())), max_age);
         }
     }
 
@@ -241,6 +242,13 @@ impl VideoParserService {
             self.config.output.max_desc_length.min(16_384)
         };
         data.desc = data.desc.chars().take(desc_limit).collect();
+        if platform == "twitter"
+            && (data.post_body_is_preview || !data.post_body.is_empty())
+            && data.source_post_url.is_empty()
+            && let Some(id) = twitter::extract_twitter_status_id(url)
+        {
+            data.source_post_url = format!("https://x.com/i/status/{id}");
+        }
         if data.media_headers.is_empty()
             && let Ok(url) = Url::parse(url)
         {
@@ -287,13 +295,6 @@ impl VideoParserService {
             return download_jm_album(&capture[2], &capture[1] == "photo", &self.config.jmcomic)
                 .await;
         }
-        if platform == "twitter"
-            && let Some(cookie_file) = authenticated_twitter_cookie_file(&self.config)
-        {
-            return self
-                .parse_twitter_authenticated(&clean_url(url), cookie_file)
-                .await;
-        }
         let resolved = if platform == "xiaohongshu" && is_short_link(url) {
             self.http.resolve_xhs_short(url).await?
         } else if platform == "bilibili" && is_short_link(url) {
@@ -304,6 +305,13 @@ impl VideoParserService {
             url.to_string()
         };
         let resolved = clean_url(&resolved);
+        if platform == "twitter"
+            && let Some(cookie_file) = authenticated_twitter_cookie_file(&self.config)
+        {
+            return self
+                .parse_twitter_authenticated(&resolved, cookie_file)
+                .await;
+        }
         let native = match platform {
             "bilibili" | "weibo" | "acfun" => {
                 sites_core::parse(&self.http, &resolved, platform).await
@@ -386,46 +394,120 @@ impl VideoParserService {
         url: &str,
         cookie_file: &str,
     ) -> Result<ParsedData> {
-        let mut blocked_until = self.twitter_auth_gate.lock().await;
-        let now = Instant::now();
-        if *blocked_until > now {
-            bail!(
-                "X 登录态请求处于限流冷却期，请在 {} 秒后重试",
-                blocked_until
-                    .duration_since(now)
-                    .as_secs()
-                    .saturating_add(1)
-            );
-        }
-        let result = twitter::parse_ytdlp(url, &self.config.ytdlp, Some(cookie_file)).await;
-        if let Err(error) = &result {
-            let message = error.to_string().to_ascii_lowercase();
-            if message
-                .split(|character: char| !character.is_ascii_alphanumeric())
-                .any(|part| part == "429")
-                || ["rate-limit", "rate limit", "too many requests"]
-                    .iter()
-                    .any(|marker| message.contains(marker))
+        let video = {
+            let mut blocked_until = self.twitter_auth_gate.lock().await;
+            check_twitter_cooldown(*blocked_until)?;
+            let result = twitter::parse_ytdlp(url, &self.config.ytdlp, Some(cookie_file)).await;
+            if let Err(error) = &result
+                && twitter_rate_limited(&error.to_string())
             {
-                *blocked_until = Instant::now()
-                    + Duration::from_secs(self.config.api.rate_limit_cooldown.clamp(1, 3600));
+                self.set_twitter_cooldown(&mut blocked_until);
+                bail!("X 暂时限流，请稍后再试（HTTP 429）");
             }
-            if is_twitter_photo_fallback(&message) {
-                return twitter::parse_native(&self.http, url)
-                    .await
-                    .map_err(|error| {
-                        if error.is::<TwitterMediaUnavailable>() {
-                            error
-                        } else {
-                            anyhow::anyhow!("X 公开图片提取失败。{error}")
-                        }
-                    });
+            result
+        };
+
+        let provisional = match video {
+            Ok(data) => Ok((data, false)),
+            Err(error) => {
+                let message = error.to_string();
+                if !is_twitter_photo_fallback(&message) {
+                    return Err(twitter_video_error(&message));
+                }
+                twitter::parse_public_with_media_hint(&self.http, url).await
             }
+        };
+        let provisional = match provisional {
+            Ok((data, false)) if !data.post_body_is_preview => return Ok(data),
+            result => result.map(|(data, _)| data),
+        };
+
+        let mut blocked_until = self.twitter_auth_gate.lock().await;
+        if let Err(error) = check_twitter_cooldown(*blocked_until) {
+            return provisional.or(Err(error));
         }
-        result.map_err(|error| {
-            anyhow::anyhow!("X 登录态解析失败，请检查 Cookie 和作品访问权限。{error}")
-        })
+        let details =
+            twitter::parse_authenticated_details(url, &self.config.ytdlp, cookie_file).await;
+        if matches!(&details, Err(twitter::TwitterDetailsError::RateLimited)) {
+            self.set_twitter_cooldown(&mut blocked_until);
+        }
+        match (provisional, details) {
+            (Ok(data), Ok(details)) => Ok(merge_twitter_details(data, details)),
+            (Err(_), Ok(details)) => Ok(details),
+            (Ok(preview), Err(_)) => Ok(preview),
+            (Err(_), Err(error)) => Err(error.into()),
+        }
     }
+
+    fn set_twitter_cooldown(&self, blocked_until: &mut Instant) {
+        *blocked_until = Instant::now()
+            + Duration::from_secs(self.config.api.rate_limit_cooldown.clamp(1, 3600));
+    }
+}
+
+fn check_twitter_cooldown(blocked_until: Instant) -> Result<()> {
+    let remaining = blocked_until.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(());
+    }
+    bail!(
+        "X 登录态请求处于限流冷却期，请在 {} 秒后重试",
+        remaining.as_secs() + 1
+    )
+}
+
+fn twitter_rate_limited(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "http error 429",
+        "http 429",
+        "rate-limit",
+        "rate limit",
+        "too many requests",
+        "限流",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn twitter_video_error(message: &str) -> anyhow::Error {
+    let message = message.to_ascii_lowercase();
+    let markers = |values: &[&str]| values.iter().any(|marker| message.contains(marker));
+    let detail = if markers(&[
+        "cookie",
+        "http error 401",
+        "http 401",
+        "log in",
+        "login required",
+    ]) {
+        "X 登录态无效或已过期，请检查 Cookie"
+    } else if markers(&[
+        "http error 403",
+        "http 403",
+        "not authorized",
+        "age-restricted",
+    ]) {
+        "X 原站拒绝访问，请确认该账号可打开原帖"
+    } else if markers(&["requested format is not available", "未获得完整的直链 mp4"]) {
+        "X 未返回可用的直链 MP4"
+    } else {
+        "X 登录态提取失败，请检查本机提取器和原帖访问权限"
+    };
+    anyhow::anyhow!(detail)
+}
+
+fn merge_twitter_details(mut data: ParsedData, details: ParsedData) -> ParsedData {
+    if !data.has_media() && details.has_media() {
+        return details;
+    }
+    if !details.post_body.is_empty() {
+        data.post_body = details.post_body;
+        data.post_body_is_preview = details.post_body_is_preview;
+    }
+    if data.source_post_url.is_empty() {
+        data.source_post_url = details.source_post_url;
+    }
+    data
 }
 
 fn is_twitter_photo_fallback(error: &str) -> bool {
@@ -481,6 +563,11 @@ fn is_short_link(raw: &str) -> bool {
 }
 
 fn parse_cache_key(url: &str, platform: &str) -> String {
+    if platform == "twitter"
+        && let Some(id) = twitter::extract_twitter_status_id(url)
+    {
+        return format!("twitter:status:{id}");
+    }
     if platform == "bilibili"
         && let Some(key) = crate::parser::bilibili_dynamic::extract_bilibili_cache_identity(url)
     {
@@ -682,6 +769,77 @@ exit 1"#,
             std::fs::read_to_string(directory.path().join("calls")).unwrap(),
             "run"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authenticated_twitter_loads_details_once_and_preserves_long_body_over_caption_limit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = authenticated_twitter_fixture(
+            directory.path(),
+            r#"printf '%s\n' 'ERROR: [twitter] 123: No video could be found in this tweet' >&2
+exit 1"#,
+        );
+        config.output.max_desc_length = 5;
+        let full_body = "全文和原始段落。\n".repeat(80);
+        let response = serde_json::json!([[2, {
+            "rest_id": "123",
+            "id_str": "123",
+            "full_text": "原站仅返回预览",
+            "note_tweet": {"note_tweet_results":{"result":{"text":&full_body}}},
+            "extended_entities":{"media":[
+                {"type":"photo","media_url_https":"https://pbs.twimg.com/media/first.jpg"},
+                {"type":"photo","media_url_https":"https://pbs.twimg.com/media/second.jpg"}
+            ]}
+        }]]);
+        let gallery = directory.path().join("gallery fixture");
+        std::fs::write(
+            &gallery,
+            format!(
+                "#!/bin/sh\nprintf 'details\\n' >> \"$(dirname \"$0\")/calls\"\nprintf '%s\\n' '{response}'\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gallery, std::fs::Permissions::from_mode(0o700)).unwrap();
+        config.ytdlp.x_details_command = gallery.to_string_lossy().into_owned();
+        let parser = VideoParserService::new(config).unwrap();
+        parser.http.cool_down("twitter").await;
+
+        for url in [
+            "https://x.com/example/status/123?s=20",
+            "https://twitter.com/i/status/123?utm_source=share",
+        ] {
+            let data = parser.parse(url, "twitter").await.unwrap();
+            assert_eq!(data.post_body.trim_end(), full_body.trim_end());
+            assert!(!data.post_body_is_preview);
+            assert!(data.desc.chars().count() <= 5);
+            assert_eq!(data.images.len(), 2);
+            assert_eq!(data.source_post_url, "https://x.com/i/status/123");
+        }
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "details\n"
+        );
+    }
+
+    #[test]
+    fn twitter_details_complete_text_without_replacing_public_gallery() {
+        let mut public = ParsedData::empty("image");
+        public.images = vec!["one".into(), "two".into()];
+        public.desc = "预览".into();
+        public.post_body_is_preview = true;
+
+        let mut details = ParsedData::empty("image");
+        details.images = vec!["one".into()];
+        details.post_body = "完整正文".into();
+        details.source_post_url = "https://x.com/i/status/123".into();
+
+        let data = merge_twitter_details(public, details);
+        assert_eq!(data.images, ["one", "two"]);
+        assert_eq!(data.post_body, "完整正文");
+        assert!(!data.post_body_is_preview);
     }
 
     #[tokio::test]

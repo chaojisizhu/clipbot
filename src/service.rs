@@ -14,8 +14,8 @@ use crate::bot::blacklist::{
     BanOutcome, BlacklistCommand, BlacklistStore, format_user_label, parse_blacklist_command,
 };
 use crate::bot::message::{
-    MarkdownOptions, build_result_markdown, markdown_payload, media_payload, quoted_text_payload,
-    text_payload,
+    MarkdownOptions, build_result_markdown, markdown_image_tag, markdown_payload, media_payload,
+    quoted_text_payload, text_payload,
 };
 use crate::bot::qqbot::{MARKDOWN_IMAGE_MAX_BYTES, QQBotClient, QQBotError};
 use crate::parser::api::VideoParserService;
@@ -39,8 +39,14 @@ use crate::types::{
 };
 
 const QQ_ERR_CONTENT_VIOLATION: i64 = 40_034_006;
+// Give Markdown syntax and media tags room in each X post reply.
+const X_MARKDOWN_REPLY_BYTES: usize = 3500;
+const X_MAX_POST_REPLIES: usize = 3;
 
 static ARCHIVE_EXT_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\.(7z|zip)$").unwrap());
+static X_CANONICAL_URL_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^https://x\.com/(?:i/web|[A-Za-z0-9_]{1,15})/status/[0-9]{1,20}$").unwrap()
+});
 static JM_TASK_GATE: Semaphore = Semaphore::const_new(1);
 static LIVE_ALBUM_GATE: Semaphore = Semaphore::const_new(1);
 
@@ -348,7 +354,7 @@ impl AppState {
 
         let result_count = parsed_results.len();
         let mut delivered_count = 0usize;
-        for (item, parsed, text, mut claim) in parsed_results {
+        for (index, (item, parsed, text, mut claim)) in parsed_results.into_iter().enumerate() {
             if let Some(attachment) = parsed.attachment.clone() {
                 if self.send_attachment(&event, &attachment).await {
                     claim.commit();
@@ -364,7 +370,8 @@ impl AppState {
             {
                 self.send_live_album_result(&event, &parsed, &text).await
             } else {
-                self.send_media_result(&event, parsed, text).await
+                self.send_media_result(&event, parsed, text, result_count - index - 1)
+                    .await
             };
             if delivered {
                 claim.commit();
@@ -664,6 +671,44 @@ impl AppState {
         true
     }
 
+    async fn send_x_post_reply(&self, event: &QQChatEvent, payload: Value) -> bool {
+        match self.bot.reply_passive(event, &payload).await {
+            Ok(_) => true,
+            Err(error) => {
+                warn!("X 帖子回复发送失败: {error}");
+                if let QQBotError::Api(error) = &error
+                    && error.err_code == QQ_ERR_CONTENT_VIOLATION
+                    && self.bot.remaining_passive_replies(event).await > 0
+                {
+                    self.bot
+                        .reply_passive(
+                            event,
+                            &text_payload("⚠️ QQ 内容审核拦截，未发送此部分 X 帖子。"),
+                        )
+                        .await
+                        .ok();
+                }
+                false
+            }
+        }
+    }
+
+    async fn send_x_post_replies(
+        &self,
+        event: &QQChatEvent,
+        replies: impl IntoIterator<Item = String>,
+    ) -> bool {
+        for markdown in replies {
+            if !self
+                .send_x_post_reply(event, markdown_payload(markdown, false))
+                .await
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn claim_link(&self, event: &QQChatEvent, url: &str) -> Option<DedupClaim> {
         let interval = self.config.output.deduplication_interval;
         let key = format!("{:?}:{}:{url}", event.chat_type, event.chat_id);
@@ -791,7 +836,7 @@ impl AppState {
         if parsed.live_photo.is_empty() {
             self.send_message(event, text_payload("原帖只返回了静态图片，下面是原图集。"))
                 .await;
-            return self.send_gallery_result(event, parsed, text).await;
+            return self.send_gallery_result(event, parsed, text, None).await;
         }
         let started = Instant::now();
         let Ok(permit) = LIVE_ALBUM_GATE.try_acquire() else {
@@ -800,7 +845,7 @@ impl AppState {
                 text_payload("另一个实况图集正在合并，先发原图。想看视频可以稍后重试。"),
             )
             .await;
-            self.send_gallery_result(event, parsed, text).await;
+            self.send_gallery_result(event, parsed, text, None).await;
             return false;
         };
         let file_info = async {
@@ -830,7 +875,7 @@ impl AppState {
                     text_payload("实况短片暂时无法合并发送，下面是原图集。"),
                 )
                 .await;
-                return self.send_gallery_result(event, parsed, text).await;
+                return self.send_gallery_result(event, parsed, text, None).await;
             }
         };
         match self.bot.reply(event, &media_payload(file_info)).await {
@@ -839,7 +884,7 @@ impl AppState {
                 warn!("QQ 拒绝发送合并后的实况视频: {error}");
                 self.send_message(event, text_payload("QQ 拒绝发送实况视频，下面是原图集。"))
                     .await;
-                return self.send_gallery_result(event, parsed, text).await;
+                return self.send_gallery_result(event, parsed, text, None).await;
             }
             Err(error) => {
                 warn!("实况视频发送结果未确认: {error}");
@@ -875,7 +920,25 @@ impl AppState {
         event: &QQChatEvent,
         parsed: ParsedData,
         text: String,
+        remaining_results: usize,
     ) -> bool {
+        let x_reply_budget = if (parsed.is_text_post() || self.config.output.show_image_text)
+            && (!parsed.post_body.is_empty() || parsed.post_body_is_preview)
+        {
+            let budget = self
+                .bot
+                .remaining_passive_replies(event)
+                .await
+                .saturating_sub(remaining_results)
+                .min(X_MAX_POST_REPLIES);
+            if budget == 0 {
+                warn!("当前消息的剩余 QQ 回复额度不足，未发送 X 帖子");
+                return false;
+            }
+            Some(budget)
+        } else {
+            None
+        };
         let is_video = !parsed.video.is_empty()
             && (parsed.media_type == "video"
                 || (parsed.media_type == "live"
@@ -886,12 +949,16 @@ impl AppState {
             || (parsed.media_type == "live"
                 && (!parsed.images.is_empty() || !parsed.live_photo.is_empty()));
         if is_gallery {
-            return self.send_gallery_result(event, &parsed, &text).await;
+            return self
+                .send_gallery_result(event, &parsed, &text, x_reply_budget)
+                .await;
         }
 
         let mut video_file_info = String::new();
         let mut video_failed_note = String::new();
-        if is_video && self.config.output.show_video_file {
+        let video_reply = is_video && self.config.output.show_video_file;
+        let one_reply_for_video_post = video_reply && x_reply_budget == Some(1);
+        if video_reply && !one_reply_for_video_post {
             let relay_video = || async {
                 let download_started = Instant::now();
                 let temporary =
@@ -1016,10 +1083,15 @@ impl AppState {
             },
         );
         if is_text_post && markdown.trim().is_empty() {
-            markdown = if !parsed.title.is_empty() && !parsed.desc.is_empty() {
-                format!("{}\n{}", parsed.title, parsed.desc)
-            } else if !parsed.desc.is_empty() {
-                parsed.desc.clone()
+            let description = if parsed.post_body.is_empty() {
+                &parsed.desc
+            } else {
+                &parsed.post_body
+            };
+            markdown = if !parsed.title.is_empty() && !description.is_empty() {
+                format!("{}\n{}", parsed.title, description)
+            } else if !description.is_empty() {
+                description.clone()
             } else {
                 parsed.title.clone()
             };
@@ -1028,7 +1100,20 @@ impl AppState {
             markdown.push('\n');
             markdown.push_str(&video_failed_note);
         }
-        if !markdown.trim().is_empty() {
+        if let Some(budget) = x_reply_budget {
+            if one_reply_for_video_post {
+                append_markdown_part(
+                    &mut markdown,
+                    &x_original_post_notice(
+                        "回复额度不足，视频请查看原帖",
+                        &parsed.source_post_url,
+                    ),
+                );
+            }
+            let text_budget = budget - usize::from(!video_file_info.is_empty());
+            let replies = x_post_markdown_replies(markdown, String::new(), &parsed, text_budget);
+            delivered &= self.send_x_post_replies(event, replies).await;
+        } else if !markdown.trim().is_empty() {
             delivered &= self
                 .send_message(event, markdown_payload(markdown, false))
                 .await;
@@ -1036,9 +1121,12 @@ impl AppState {
             delivered = false;
         }
         if !video_file_info.is_empty() {
-            delivered &= self
-                .send_message(event, media_payload(video_file_info))
-                .await;
+            let payload = media_payload(video_file_info);
+            delivered &= if x_reply_budget.is_some() {
+                self.send_x_post_reply(event, payload).await
+            } else {
+                self.send_message(event, payload).await
+            };
         }
         transfer_succeeded && delivered
     }
@@ -1116,10 +1204,11 @@ impl AppState {
         event: &QQChatEvent,
         parsed: &ParsedData,
         text: &str,
+        x_reply_budget: Option<usize>,
     ) -> bool {
         // The account may deduplicate material IDs. Keep ownership, publication and
         // deletion in one bounded gallery turn so another reply cannot lose its material.
-        let _gate = self.gallery_material_gate.lock().await;
+        let gate = self.gallery_material_gate.lock().await;
         self.cleanup_due_materials().await;
         if let Err(error) = self.with_materials(|owned| owned.ensure_capacity(1)) {
             warn!("图集暂不可创建素材: {error}");
@@ -1175,12 +1264,30 @@ impl AppState {
             .map(|image| image.image_id.clone())
             .collect();
         let failed_count = selected_count - images.len();
-        let markdown = self.gallery_markdown(text, &images, failed_count, omitted_count);
-        match self
-            .bot
-            .reply(event, &markdown_payload(markdown, !images.is_empty()))
-            .await
-        {
+        let (markdown, followups) = if let Some(budget) = x_reply_budget {
+            let image_markup = self.gallery_markdown("", &images, failed_count, omitted_count);
+            let caption = if self.config.output.show_image_text {
+                text
+            } else {
+                ""
+            };
+            let mut replies =
+                x_post_markdown_replies(caption.to_owned(), image_markup, parsed, budget)
+                    .into_iter();
+            (replies.next().unwrap_or_default(), replies)
+        } else {
+            (
+                self.gallery_markdown(text, &images, failed_count, omitted_count),
+                Vec::new().into_iter(),
+            )
+        };
+        let payload = markdown_payload(markdown, !images.is_empty());
+        let sent = if x_reply_budget.is_some() {
+            self.bot.reply_passive(event, &payload).await
+        } else {
+            self.bot.reply(event, &payload).await
+        };
+        match sent {
             Ok(_) => {
                 info!(
                     "图集素材 Markdown 已发送，{} 张图片，{} 张准备失败，{} 张受配置上限限制",
@@ -1191,7 +1298,9 @@ impl AppState {
                 // QQ stores a sent-message copy, so owned materials can be deleted
                 // after its successful acknowledgement without breaking that message.
                 self.release_gallery_materials(&releasable).await;
-                failed_count == 0 && !images.is_empty()
+                drop(gate);
+                let caption_delivered = self.send_x_post_replies(event, followups).await;
+                caption_delivered && failed_count == 0 && !images.is_empty()
             }
             Err(error) => {
                 warn!("图集素材 Markdown 发送未完成: {error}");
@@ -1227,23 +1336,17 @@ impl AppState {
         failed_count: usize,
         omitted_count: usize,
     ) -> String {
-        let mut gallery = ParsedData::empty("image");
-        gallery.images = images.iter().map(|image| image.url.clone()).collect();
-        gallery.image_size_map = Some(
-            images
-                .iter()
-                .map(|image| (image.url.clone(), image.size.clone()))
-                .collect(),
-        );
-        let mut markdown = build_result_markdown(
-            &gallery,
-            text,
-            &MarkdownOptions {
-                show_image_text: self.config.output.show_image_text,
-                show_cover: false,
-                max_images: images.len(),
-            },
-        );
+        let mut markdown = if self.config.output.show_image_text {
+            text.to_owned()
+        } else {
+            String::new()
+        };
+        for image in images {
+            if !markdown.is_empty() {
+                markdown.push('\n');
+            }
+            markdown.push_str(&markdown_image_tag(&image.url, Some(&image.size)));
+        }
         if failed_count > 0 {
             markdown.push_str(&format!("\n⚠️ {failed_count} 张图片准备失败，未发送。支持 PNG/JPEG/GIF/WebP，单张上限 10 MB。"));
         }
@@ -1294,6 +1397,111 @@ impl AppState {
     }
 }
 
+fn append_markdown_part(markdown: &mut String, part: &str) {
+    if !part.is_empty() {
+        if !markdown.is_empty() && !markdown.ends_with('\n') && !part.starts_with('\n') {
+            markdown.push('\n');
+        }
+        markdown.push_str(part);
+    }
+}
+
+fn x_original_post_notice(notice: &str, source_post_url: &str) -> String {
+    if X_CANONICAL_URL_RE.is_match(source_post_url) {
+        format!("{notice}：{source_post_url}")
+    } else {
+        format!("{notice}。")
+    }
+}
+
+fn x_post_markdown_replies(
+    mut caption: String,
+    image_markup: String,
+    post: &ParsedData,
+    budget: usize,
+) -> Vec<String> {
+    if budget == 0 {
+        return Vec::new();
+    }
+    if post.post_body_is_preview {
+        append_markdown_part(
+            &mut caption,
+            &x_original_post_notice("正文预览，完整内容请查看原帖", &post.source_post_url),
+        );
+    }
+    if caption.len() + image_markup.len() < X_MARKDOWN_REPLY_BYTES || caption.is_empty() {
+        append_markdown_part(&mut caption, &image_markup);
+        return if caption.is_empty() {
+            Vec::new()
+        } else {
+            vec![caption]
+        };
+    }
+
+    let link_note = x_original_post_notice(
+        "此处仅展示可发送的正文，完整内容请查看原帖",
+        &post.source_post_url,
+    );
+    let mut replies = Vec::with_capacity(budget);
+    let mut rest = caption.as_str();
+    for index in 0..budget {
+        let images = if index == 0 {
+            image_markup.as_str()
+        } else {
+            ""
+        };
+        let capacity =
+            X_MARKDOWN_REPLY_BYTES.saturating_sub(images.len() + usize::from(!images.is_empty()));
+        let needs_note = index + 1 == budget && rest.len() > capacity;
+        let body_room = if needs_note {
+            capacity.saturating_sub(link_note.len() + 1)
+        } else {
+            capacity
+        };
+        let cut = x_caption_split_at(rest, body_room);
+        let mut message = rest[..cut].to_owned();
+        rest = &rest[cut..];
+
+        if needs_note {
+            // A gallery is sent atomically. Even with no room for the body, the
+            // notice may use the remaining caption capacity before the images.
+            append_markdown_part(&mut message, &link_note);
+        }
+        append_markdown_part(&mut message, images);
+        if !message.is_empty() {
+            replies.push(message);
+        }
+        if rest.is_empty() {
+            break;
+        }
+    }
+    replies
+}
+
+fn x_caption_split_at(text: &str, capacity: usize) -> usize {
+    if text.len() <= capacity {
+        return text.len();
+    }
+    let end = text.floor_char_boundary(capacity);
+    if end == 0 {
+        return 0;
+    }
+    let minimum = text.floor_char_boundary(end / 2);
+    let suffix = &text[minimum..end];
+    suffix
+        .rfind("\n\n")
+        .map(|index| index + 2)
+        .or_else(|| suffix.rfind('\n').map(|index| index + 1))
+        .or_else(|| {
+            suffix
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| ch.is_whitespace())
+                .map(|(index, ch)| index + ch.len_utf8())
+        })
+        .map_or(end, |index| minimum + index)
+}
+
 fn file_info_from_upload(upload: Value) -> anyhow::Result<String> {
     upload
         .get("file_info")
@@ -1309,6 +1517,30 @@ fn concise_user_parse_error(message: &str) -> String {
         .next()
         .unwrap_or(message)
         .trim();
+    if let Some(module) = base.strip_prefix("JM 缺少 Python 依赖 ")
+        && !module.is_empty()
+        && module.len() <= 64
+        && module
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+    {
+        return base.to_owned();
+    }
+    if base.starts_with("X 登录态无效或已过期") || base.starts_with("X 登录态不可用")
+    {
+        return "X 登录态不可用，请联系管理员检查 Cookie".into();
+    }
+    if base.starts_with("X 原站拒绝访问") || base.starts_with("当前 X 账号没有查看此帖的权限")
+    {
+        return "当前账号在 X 上无法查看原帖，请检查作品和账号权限".into();
+    }
+    if base.starts_with("X 未返回可用的直链 MP4") || base.starts_with("X 未返回受支持的图片")
+    {
+        return "X 未返回支持的媒体格式，请前往原帖查看".into();
+    }
+    if base.starts_with("X 暂时限流") || base.starts_with("X 详情查询暂时限流") {
+        return "X 暂时限流，请稍后再试".into();
+    }
     if base.contains("此动态为充电会员专属") {
         return "此动态为充电会员专属，不可访问".into();
     }
@@ -1516,6 +1748,10 @@ mod tests {
     #[test]
     fn maps_non_bug_failures_to_concise_group_notices() {
         assert_eq!(
+            concise_user_parse_error("JM 缺少 Python 依赖 requests"),
+            "JM 缺少 Python 依赖 requests"
+        );
+        assert_eq!(
             concise_user_parse_error("此动态为充电会员专属，不可访问"),
             "此动态为充电会员专属，不可访问"
         );
@@ -1593,6 +1829,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn x_post_markdown_keeps_the_gallery_and_splits_on_paragraphs() {
+        let post = ParsedData::empty("image");
+        let first = format!("{}\n\n", "正文🙂".repeat(240));
+        let second = "第二段。".repeat(240);
+        let caption = format!("{first}{second}");
+        let gallery = "![#100px #100px](qqbot-media://image/v1/one)\n![#100px #100px](qqbot-media://image/v1/two)";
+        let replies = x_post_markdown_replies(caption, gallery.into(), &post, 3);
+        assert_eq!(replies, [format!("{first}{gallery}"), second]);
+        assert!(
+            replies
+                .iter()
+                .all(|message| message.len() <= X_MARKDOWN_REPLY_BYTES)
+        );
+    }
+
+    #[test]
+    fn x_post_markdown_labels_preview_and_respects_the_reply_budget() {
+        let mut post = ParsedData::empty("text");
+        post.source_post_url = "https://x.com/i/web/status/1234".into();
+        post.post_body_is_preview = true;
+        let replies = x_post_markdown_replies("可见正文".into(), String::new(), &post, 1);
+        assert_eq!(
+            replies,
+            ["可见正文\n正文预览，完整内容请查看原帖：https://x.com/i/web/status/1234"]
+        );
+
+        post.post_body_is_preview = false;
+        let body = "🙂".repeat(2500);
+        let replies = x_post_markdown_replies(body, String::new(), &post, 2);
+        assert_eq!(replies.len(), 2);
+        assert!(
+            replies
+                .iter()
+                .all(|message| message.len() <= X_MARKDOWN_REPLY_BYTES)
+        );
+        assert!(replies[1].ends_with(&post.source_post_url));
+        assert!(replies[1].contains("此处仅展示可发送的正文"));
+    }
+
     #[tokio::test]
     async fn send_media_result_delivers_text_only_posts_as_markdown_even_when_show_image_text_disabled()
      {
@@ -1646,7 +1922,11 @@ mod tests {
             ..QQChatEvent::default()
         };
 
-        assert!(app_state.send_media_result(&event, parsed, formatted).await);
+        assert!(
+            app_state
+                .send_media_result(&event, parsed, formatted, 0)
+                .await
+        );
         let messages = sent.lock().await;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["msg_type"], 2);
@@ -1659,6 +1939,136 @@ mod tests {
         assert!(md.contains("作者：陈睿"));
         assert!(md.contains("就在今天！\n我们是冠军！！！"));
         assert!(md.contains("点赞：38000"));
+        drop(messages);
+
+        let mut x_post = ParsedData::empty("text");
+        x_post.desc = "旧的预览".into();
+        x_post.post_body = format!("{}\n\n第二段的尾巴", "长文🙂".repeat(360));
+        x_post.source_post_url = "https://x.com/i/status/123".into();
+        let tail = "第二段的尾巴";
+        let formatted = generate_formatted_text(&x_post, &config.output.format);
+        assert!(formatted.contains(tail));
+        assert!(!formatted.contains("旧的预览"));
+        assert!(
+            app_state
+                .send_media_result(&event, x_post, formatted, 1)
+                .await
+        );
+
+        let messages = sent.lock().await;
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["msg_type"], 2);
+        assert_eq!(messages[2]["msg_type"], 2);
+        assert_eq!(messages[1]["msg_seq"], 2);
+        assert_eq!(messages[2]["msg_seq"], 3);
+        let continuation = messages[2]["markdown"]["content"].as_str().unwrap();
+        assert!(continuation.ends_with(tail));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn marked_x_video_uses_regular_qq_media_and_honors_moderation() {
+        use axum::{
+            Json, Router,
+            http::StatusCode,
+            routing::{head, post},
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let source = format!("{base}/fixture.mp4");
+        let uploads = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let messages = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let received_uploads = Arc::clone(&uploads);
+        let received_messages = Arc::clone(&messages);
+        let app = Router::new()
+            .route(
+                "/app/getAppAccessToken",
+                post(|| async { Json(json!({"access_token":"VIDEO_TOKEN","expires_in":7200})) }),
+            )
+            .route("/fixture.mp4", head(|| async { StatusCode::OK }))
+            .route(
+                "/v2/groups/{group}/files",
+                post(move |Json(body): Json<Value>| {
+                    let uploads = Arc::clone(&received_uploads);
+                    async move {
+                        uploads.lock().await.push(body);
+                        Json(json!({"file_info":"synthetic-video"}))
+                    }
+                }),
+            )
+            .route(
+                "/v2/groups/{group}/messages",
+                post(move |Json(body): Json<Value>| {
+                    let messages = Arc::clone(&received_messages);
+                    async move {
+                        let blocked = body["msg_id"] == "blocked";
+                        messages.lock().await.push(body);
+                        if blocked {
+                            Json(json!({"err_code":QQ_ERR_CONTENT_VIOLATION,"message":"消息内容违规"}))
+                        } else {
+                            Json(json!({"id":"sent-video"}))
+                        }
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.qqbot.app_id = "app".into();
+        config.qqbot.app_secret = "secret".into();
+        config.qqbot.api_base = base;
+        config.output.show_image_text = false;
+        config.output.temp_dir = directory.path().to_str().unwrap().into();
+        let config = Arc::new(config);
+        let app = AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        );
+
+        let video = crate::parser::twitter::map_ytdlp_json(&json!({
+            "extractor_key": "Twitter",
+            "age_limit": 18,
+            "description": "测试短正文",
+            "formats": [{
+                "url": source,
+                "ext": "mp4",
+                "protocol": "http",
+                "vcodec": "h264",
+                "acodec": "aac"
+            }]
+        }));
+        for (message_id, accepted) in [("allowed", true), ("blocked", false)] {
+            let event = QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_VIDEO".into(),
+                message_id: message_id.into(),
+                ..QQChatEvent::default()
+            };
+            let formatted = generate_formatted_text(&video, &config.output.format);
+            assert_eq!(
+                app.send_media_result(&event, video.clone(), formatted, 0)
+                    .await,
+                accepted
+            );
+        }
+
+        let uploads = uploads.lock().await;
+        assert_eq!(uploads.len(), 2);
+        assert!(uploads.iter().all(|body| {
+            body["file_type"] == 2 && body["url"] == source && body["srv_send_msg"] == false
+        }));
+        let messages = messages.lock().await;
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|body| {
+            body["msg_type"] == 7 && body["media"]["file_info"] == "synthetic-video"
+        }));
+        assert_eq!(messages[1]["msg_id"], "blocked");
         server.abort();
     }
 

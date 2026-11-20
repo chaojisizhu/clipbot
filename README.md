@@ -79,7 +79,7 @@ Compose 默认构建 `media` 镜像，以非 root 用户运行，配置及 Cooki
 | --- | --- |
 | `runtime` | Rust 主程序、证书和运行库 |
 | `media` | `runtime`、FFmpeg 和 ffprobe |
-| `extras` | `media`、Python、yt-dlp 和 JMComic |
+| `extras` | `media`、Python、yt-dlp、gallery-dl 和 JMComic |
 | `test` | 编译并执行默认测试 |
 
 需要可选 Python 功能时，可将 Compose 的构建目标改为 `extras`。B站扫码会写入 Cookie 文件，使用 Docker 登录时需为该次运行提供可写的 Cookie 挂载，随后重启机器人加载。
@@ -118,7 +118,7 @@ Windows 对应命令为 `clipbot.exe login bilibili`。用 B站 App 扫描生成
 
 - **抖音**：部分公开内容可直接解析。需要登录的图集或实况内容使用 `auth.cookies.douyin`，Web 详情签名从该会话读取 UIFID。使用 Cookie 文件时，需保留 `douyin.com`、`iesdouyin.com` 各自正确的域范围。
 - **小红书**：在 `auth.cookies.xiaohongshu` 配置登录态，分享链接应保留 `xsec_token`。
-- **X / Twitter**：登录态使用 `auth.cookieFiles.twitter` 指向的 Netscape 文件，并启用 `ytdlp.enabled`；认证提取使用本机 yt-dlp。
+- **X / Twitter**：启用 `ytdlp.enabled`，并将 `auth.cookieFiles.twitter` 指向可读取的 Netscape Cookie 文件。本机 yt-dlp 提取视频，长帖缺少正文或公开接口取不到图文时按需调用本机 gallery-dl，仅提取单帖元数据。Linux 可使用 `extras` 镜像或在项目虚拟环境中安装 `scripts/requirements-extras.txt`。需要指定可执行文件时，设置 `ytdlp.xDetailsCommand`。X 原站限制仍取决于账号权限。
 - **微信视频号**：使用 `channels.yuanbaoCookie`。元宝登录过期时需要更新 Cookie。
 
 配置文件、Cookie、环境文件、日志和构建产物已加入 Git 忽略规则。发布包使用空凭据示例配置。提交 Issue 或日志时，请移除账号凭据、Cookie、带签名的媒体地址及私人会话信息。
