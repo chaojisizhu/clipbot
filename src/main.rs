@@ -223,12 +223,25 @@ async fn run_bot(config: AppConfig, parser: Arc<VideoParserService>) -> Result<(
     let config = Arc::new(config);
     let bot = Arc::new(QQBotClient::new(config.qqbot.clone()));
     let state = Arc::new(AppState::new(config, parser, Arc::clone(&bot)));
+    state.ensure_blacklist_ready()?;
     state.cleanup_markdown_materials().await;
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let mut bot_task = tokio::spawn(Arc::clone(&bot).run(tx));
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let bot_task = tokio::spawn(Arc::clone(&bot).run(tx));
+    run_bot_loop(bot, state, bot_task, rx, task_limit, shutdown_signal()).await
+}
+
+async fn run_bot_loop(
+    bot: Arc<QQBotClient>,
+    state: Arc<AppState>,
+    mut bot_task: tokio::task::JoinHandle<Result<()>>,
+    mut rx: tokio::sync::mpsc::Receiver<BotEvent>,
+    task_limit: usize,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
     let mut workers = JoinSet::new();
     let mut finished = false;
     let mut bot_result = Ok(());
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
             event = rx.recv(), if workers.len() < task_limit => {
@@ -250,17 +263,20 @@ async fn run_bot(config: AppConfig, parser: Arc<VideoParserService>) -> Result<(
                 bot_result = result.context("QQ网关任务异常")?;
                 break;
             }
-            _ = shutdown_signal() => break,
+            _ = &mut shutdown => break,
         }
     }
     bot.stop();
-    if !finished
-        && tokio::time::timeout(Duration::from_secs(5), &mut bot_task)
-            .await
-            .is_err()
-    {
-        bot_task.abort();
-        let _ = bot_task.await;
+    if !finished {
+        match tokio::time::timeout(Duration::from_secs(5), &mut bot_task).await {
+            Ok(result) => {
+                bot_result = result.context("QQ网关任务异常")?;
+            }
+            Err(_) => {
+                bot_task.abort();
+                let _ = bot_task.await;
+            }
+        }
     }
     if tokio::time::timeout(Duration::from_secs(10), async {
         while workers.join_next().await.is_some() {}
@@ -285,5 +301,64 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_runtime() -> (Arc<QQBotClient>, Arc<AppState>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.output.temp_dir = dir.path().to_string_lossy().into_owned();
+        // Keep temp dir path valid for the test lifetime by leaking only in unit tests?
+        // No: BlacklistStore only reads on open and returns empty when missing.
+        let config = Arc::new(config);
+        let parser = Arc::new(VideoParserService::new((*config).clone()).unwrap());
+        let bot = Arc::new(QQBotClient::new(config.qqbot.clone()));
+        let state = Arc::new(AppState::new(config, parser, Arc::clone(&bot)));
+        (bot, state)
+    }
+
+    #[tokio::test]
+    async fn gateway_startup_failure_returns_error_even_when_channel_closes_first() {
+        let (bot, state) = test_runtime();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let bot_task = tokio::spawn(async move {
+            drop(tx);
+            // Yield so rx.recv() => None wins the select! loop before bot_task resolves.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            bail!("获取 QQ 网关地址失败: 模拟启动异常");
+        });
+        let result = run_bot_loop(bot, state, bot_task, rx, 4, std::future::pending::<()>()).await;
+        let error = result.expect_err("gateway failure must return Err");
+        assert!(
+            error.to_string().contains("模拟启动异常"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_returns_ok() {
+        let (bot, state) = test_runtime();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
+        let worker_stop = Arc::clone(&stop_notify);
+        let bot_task = tokio::spawn(async move {
+            let _keep_tx = tx;
+            worker_stop.notified().await;
+            Ok(())
+        });
+        let trigger = Arc::clone(&stop_notify);
+        let shutdown = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            trigger.notify_one();
+        };
+        let result = run_bot_loop(bot, state, bot_task, rx, 4, shutdown).await;
+        assert!(
+            result.is_ok(),
+            "graceful shutdown should return Ok: {result:?}"
+        );
     }
 }

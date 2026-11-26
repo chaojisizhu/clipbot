@@ -207,11 +207,10 @@ pub fn normalize_reason(raw: &str) -> String {
 }
 
 pub fn parse_blacklist_command(event: &QQChatEvent, self_ids: &[&str]) -> Option<BlacklistCommand> {
-    let raw = if event.current_text.is_empty() {
-        event.text.trim()
-    } else {
-        event.current_text.trim()
-    };
+    let raw = event.current_text.trim();
+    if raw.is_empty() {
+        return None;
+    }
     let (is_add, after_keyword) = if let Some(rest) = raw.strip_prefix("拉黑") {
         (true, rest)
     } else {
@@ -623,6 +622,17 @@ mod tests {
             };
             assert_eq!(parse_blacklist_command(&ev, &[]), None);
         }
+
+        // Quoting an old blacklist command with empty current_text must NOT trigger management
+        let quoted_only = QQChatEvent {
+            current_text: String::new(),
+            text: "拉黑<@USER_001> 刷屏".into(),
+            mentions: vec![mention("USER_001", "李四")],
+            quoted_message_id: Some("OLD_MSG_1".into()),
+            quoted_text: Some("拉黑<@USER_001> 刷屏".into()),
+            ..QQChatEvent::default()
+        };
+        assert_eq!(parse_blacklist_command(&quoted_only, &["BOT"]), None);
     }
 
     #[test]

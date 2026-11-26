@@ -100,6 +100,31 @@ fn normalize_slashes(value: &str) -> String {
     value.replace(r"\/", "/")
 }
 
+pub fn redact_url_for_log(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(mut parsed) = url::Url::parse(trimmed) {
+        if matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") {
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            return parsed.to_string();
+        }
+        return trimmed.to_string();
+    }
+    trimmed
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+pub fn redact_urls_in_text(raw: &str) -> String {
+    URL_RE
+        .replace_all(raw, |captures: &regex::Captures<'_>| {
+            redact_url_for_log(&captures[0])
+        })
+        .into_owned()
+}
+
 fn parse_message_scene_ext(data: &Value) -> HashMap<String, String> {
     let mut result = HashMap::new();
     let Some(items) = data
@@ -443,5 +468,28 @@ mod tests {
         assert!(markdown.contains("![#1366px #2048px](https://a/1.jpg)"));
         assert!(markdown.contains("![#750px #1000px](https://a/2.jpg)"));
         assert!(markdown.contains("其余 1 张"));
+    }
+
+    #[test]
+    fn redacts_query_tokens_from_log_urls_and_ark_text() {
+        let xhs = "https://www.xiaohongshu.com/explore/6acf1818000000000a0261e5?xsec_source=app_share&xsec_token=SYNTHETIC_SECRET_TOKEN#top";
+        let redacted = redact_url_for_log(xhs);
+        assert_eq!(
+            redacted,
+            "https://www.xiaohongshu.com/explore/6acf1818000000000a0261e5"
+        );
+        assert!(!redacted.contains("SYNTHETIC_SECRET_TOKEN"));
+        assert_eq!(
+            redact_url_for_log("jm://album/1491716"),
+            "jm://album/1491716"
+        );
+
+        let ark_field = format!("jump_url={xhs}");
+        let redacted_field = redact_urls_in_text(&ark_field);
+        assert_eq!(
+            redacted_field,
+            "jump_url=https://www.xiaohongshu.com/explore/6acf1818000000000a0261e5"
+        );
+        assert!(!redacted_field.contains("SYNTHETIC_SECRET_TOKEN"));
     }
 }

@@ -353,6 +353,13 @@ pub async fn download_media_buffer_with_headers(
                 .await
                 .and_then(reqwest::Response::error_for_status)
                 .map_err(reqwest::Error::without_url)?;
+            if !response.status().is_success() {
+                return Err(PermanentMediaError(format!(
+                    "远端返回非成功响应（HTTP {}）",
+                    response.status().as_u16()
+                ))
+                .into());
+            }
             if response
                 .content_length()
                 .is_some_and(|length| length > limit)
@@ -505,7 +512,13 @@ async fn download_media_temp_with_client(
             return Err(PermanentMediaError("媒体断点续传范围无效（HTTP 416）".into()).into());
         }
         if !status.is_success() {
-            let error = response.error_for_status().unwrap_err().without_url();
+            let error: anyhow::Error = match response.error_for_status() {
+                Err(error) => error.without_url().into(),
+                Ok(_) => {
+                    PermanentMediaError(format!("远端返回非成功响应（HTTP {}）", status.as_u16()))
+                        .into()
+                }
+            };
             if (status.is_server_error() || status == reqwest::StatusCode::REQUEST_TIMEOUT)
                 && retries_used < MAX_STREAM_RETRIES
             {
@@ -513,7 +526,7 @@ async fn download_media_temp_with_client(
                 tokio::time::sleep(Duration::from_millis(250).min(remaining)).await;
                 continue;
             }
-            return Err(error.into());
+            return Err(error);
         }
 
         check_video_response(&response)?;
@@ -1119,6 +1132,46 @@ mod tests {
             "expected clear timeout error, got: {message}"
         );
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unfollowed_302_without_location_returns_error_instead_of_panicking() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/redirect.mp4", listener.local_addr().unwrap());
+        let app = axum::Router::new().route(
+            "/redirect.mp4",
+            axum::routing::get(|| async { axum::http::StatusCode::FOUND }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let temp_error = download_media_temp(
+            &url,
+            &[],
+            &HashMap::new(),
+            directory.path(),
+            16384,
+            65536,
+            Duration::from_secs(3),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            temp_error.to_string().contains("302"),
+            "expected HTTP 302 error, got: {temp_error}"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+        let buffer_error = download_media_buffer_with_headers(&url, &[], 16384, &HashMap::new())
+            .await
+            .unwrap_err();
+        assert!(
+            buffer_error.to_string().contains("302"),
+            "expected HTTP 302 buffer error, got: {buffer_error}"
+        );
         server.abort();
     }
 }

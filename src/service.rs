@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -15,7 +15,7 @@ use crate::bot::blacklist::{
 };
 use crate::bot::message::{
     MarkdownOptions, build_result_markdown, markdown_image_tag, markdown_payload, media_payload,
-    quoted_text_payload, text_payload,
+    quoted_text_payload, redact_url_for_log, text_payload,
 };
 use crate::bot::qqbot::{MARKDOWN_IMAGE_MAX_BYTES, QQBotClient, QQBotError};
 use crate::parser::api::VideoParserService;
@@ -59,6 +59,7 @@ pub struct AppState {
     local_proxies: Vec<String>,
     gallery_material_gate: tokio::sync::Mutex<()>,
     owned_materials: std::sync::Mutex<Result<OwnedMaterials, String>>,
+    blacklist_path: PathBuf,
     blacklist: std::sync::Mutex<Result<BlacklistStore, String>>,
 }
 
@@ -140,8 +141,8 @@ impl AppState {
         }
         let owned_materials = OwnedMaterials::new(Path::new(&config.output.temp_dir))
             .map_err(|error| format!("{error:#}"));
-        let blacklist = BlacklistStore::open(BlacklistStore::resolve_path(&config))
-            .map_err(|error| format!("{error:#}"));
+        let blacklist_path = BlacklistStore::resolve_path(&config);
+        let blacklist = BlacklistStore::open(&blacklist_path).map_err(|error| format!("{error:#}"));
         if let Err(ref error) = blacklist {
             warn!("初始化全局黑名单失败: {error}");
         }
@@ -154,8 +155,13 @@ impl AppState {
             local_proxies,
             gallery_material_gate: tokio::sync::Mutex::new(()),
             owned_materials: std::sync::Mutex::new(owned_materials),
+            blacklist_path,
             blacklist: std::sync::Mutex::new(blacklist),
         }
+    }
+
+    pub fn ensure_blacklist_ready(&self) -> anyhow::Result<()> {
+        self.with_blacklist(|_| Ok(()))
     }
 
     pub async fn handle_message(self: Arc<Self>, event: QQChatEvent) {
@@ -231,7 +237,10 @@ impl AppState {
             .await
             {
                 Ok(Some(resolved)) => {
-                    info!("卡片无链接，已按标题还原: {}", resolved.url);
+                    info!(
+                        "卡片无链接，已按标题还原: {}",
+                        redact_url_for_log(&resolved.url)
+                    );
                     matches = vec![resolved];
                     card_resolved = true;
                 }
@@ -259,7 +268,8 @@ impl AppState {
             if !enabled {
                 info!(
                     "平台 {} 已在配置中禁用，跳过: {}",
-                    item.media_type, item.url
+                    item.media_type,
+                    redact_url_for_log(&item.url)
                 );
             }
             enabled
@@ -283,7 +293,10 @@ impl AppState {
             if let Some(claim) = self.claim_link(&event, &item.url) {
                 pending.push((item, claim));
             } else {
-                info!("链接处于去重冷却期内，跳过: {}", item.url);
+                info!(
+                    "链接处于去重冷却期内，跳过: {}",
+                    redact_url_for_log(&item.url)
+                );
             }
         }
         if pending.is_empty() {
@@ -305,7 +318,7 @@ impl AppState {
             pending.len(),
             pending
                 .iter()
-                .map(|(item, _)| item.url.as_str())
+                .map(|(item, _)| redact_url_for_log(&item.url))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -331,7 +344,8 @@ impl AppState {
                 crate::parser::api::ParseResult::Failure(message) => {
                     warn!(
                         elapsed_ms = started.elapsed().as_millis(),
-                        "解析失败 [{}]: {message}", item.url
+                        "解析失败 [{}]: {message}",
+                        redact_url_for_log(&item.url)
                     );
                     let user_message = concise_user_parse_error(&message);
                     failed_errors.push(render_parse_error(&self.config, &item.url, &user_message));
@@ -402,6 +416,10 @@ impl AppState {
             .blacklist
             .lock()
             .map_err(|_| anyhow::anyhow!("黑名单状态锁不可用"))?;
+        if state.is_err() {
+            *state =
+                BlacklistStore::open(&self.blacklist_path).map_err(|error| format!("{error:#}"));
+        }
         let store = state
             .as_mut()
             .map_err(|error| anyhow::anyhow!("黑名单状态不可用: {error}"))?;
@@ -522,8 +540,13 @@ impl AppState {
         {
             Ok(reason) => reason,
             Err(error) => {
-                warn!("读取全局黑名单失败: {error}");
-                None
+                warn!("读取全局黑名单失败，已暂停受限功能: {error}");
+                self.send_message(
+                    event,
+                    text_payload("⚠️ 黑名单状态异常，当前暂不可用，请联系管理员检查黑名单文件。"),
+                )
+                .await;
+                return true;
             }
         };
         let Some(reason) = reason else {
@@ -1035,7 +1058,10 @@ impl AppState {
                             video_file_info = file_info;
                             info!(
                                 "视频已转存: {}",
-                                parsed.video.chars().take(80).collect::<String>()
+                                redact_url_for_log(&parsed.video)
+                                    .chars()
+                                    .take(80)
+                                    .collect::<String>()
                             );
                         }
                         Err(first_error) => {
@@ -1050,7 +1076,10 @@ impl AppState {
                                     video_file_info = file_info;
                                     info!(
                                         "平台转存重试成功: {}",
-                                        parsed.video.chars().take(80).collect::<String>()
+                                        redact_url_for_log(&parsed.video)
+                                            .chars()
+                                            .take(80)
+                                            .collect::<String>()
                                     );
                                 }
                                 Err(second_error) => {
@@ -1073,13 +1102,58 @@ impl AppState {
         let transfer_succeeded = video_failed_note.is_empty();
         let is_text_post = parsed.is_text_post();
         let mut delivered = true;
+        let mut sent_any = false;
+        let wants_cover =
+            self.config.output.show_cover && !parsed.cover.is_empty() && !is_text_post;
+        let cover_gate = if wants_cover {
+            let gate = self.gallery_material_gate.lock().await;
+            self.cleanup_due_materials().await;
+            Some(gate)
+        } else {
+            None
+        };
+        let mut cover_image = None;
+        let mut cover_releasable = Vec::new();
+        if cover_gate.is_some() {
+            let prior_ids = self
+                .with_materials(|owned| {
+                    Ok(owned
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.id.clone())
+                        .collect::<Vec<_>>())
+                })
+                .unwrap_or_default();
+            match self
+                .prepare_gallery_image(&parsed.cover, &parsed.media_headers)
+                .await
+            {
+                Ok(image) => {
+                    if !prior_ids.contains(&image.image_id) {
+                        cover_releasable.push(image.image_id.clone());
+                    }
+                    cover_image = Some(image);
+                }
+                Err(error) => {
+                    warn!("视频封面素材准备失败，已跳过封面: {error}");
+                }
+            }
+        }
+        let mut cover_data = ParsedData::empty("video");
+        let cover_markup = if let Some(image) = &cover_image {
+            cover_data.cover = image.url.clone();
+            cover_data.cover_size = Some(image.size.clone());
+            markdown_image_tag(&image.url, Some(&image.size))
+        } else {
+            String::new()
+        };
         let mut markdown = build_result_markdown(
-            &ParsedData::empty("video"),
+            &cover_data,
             &text,
             &MarkdownOptions {
                 show_image_text: self.config.output.show_image_text || is_text_post,
-                show_cover: false,
-                max_images: 0,
+                show_cover: cover_image.is_some() && x_reply_budget.is_none(),
+                max_images: 1,
             },
         );
         if is_text_post && markdown.trim().is_empty() {
@@ -1111,24 +1185,119 @@ impl AppState {
                 );
             }
             let text_budget = budget - usize::from(!video_file_info.is_empty());
-            let replies = x_post_markdown_replies(markdown, String::new(), &parsed, text_budget);
-            delivered &= self.send_x_post_replies(event, replies).await;
+            let mut replies =
+                x_post_markdown_replies(markdown, cover_markup, &parsed, text_budget).into_iter();
+            if let Some(first) = replies.next() {
+                let first_payload = markdown_payload(first, cover_image.is_some());
+                match self.bot.reply_passive(event, &first_payload).await {
+                    Ok(_) => {
+                        sent_any = true;
+                        if !cover_releasable.is_empty() {
+                            self.release_gallery_materials(&cover_releasable).await;
+                        }
+                        drop(cover_gate);
+                        delivered &= self.send_x_post_replies(event, replies).await;
+                    }
+                    Err(error) => {
+                        warn!("X 帖子回复发送失败: {error}");
+                        match &error {
+                            QQBotError::Api(api_error) => {
+                                if !cover_releasable.is_empty() {
+                                    self.release_gallery_materials(&cover_releasable).await;
+                                }
+                                if api_error.err_code == QQ_ERR_CONTENT_VIOLATION
+                                    && self.bot.remaining_passive_replies(event).await > 0
+                                {
+                                    self.bot
+                                        .reply_passive(
+                                            event,
+                                            &text_payload(
+                                                "⚠️ QQ 内容审核拦截，未发送此部分 X 帖子。",
+                                            ),
+                                        )
+                                        .await
+                                        .ok();
+                                }
+                            }
+                            QQBotError::Other(_) => {
+                                if let Some(image) = &cover_image {
+                                    let deadline = unix_now().unwrap_or(0).saturating_add(300);
+                                    if let Err(err) = self.with_materials(|owned| {
+                                        owned.mark_due(
+                                            std::slice::from_ref(&image.image_id),
+                                            deadline,
+                                        )
+                                    }) {
+                                        warn!("延后清理未确认封面素材的记录更新失败: {err}");
+                                    }
+                                }
+                            }
+                        }
+                        drop(cover_gate);
+                        delivered = false;
+                    }
+                }
+            } else {
+                if !cover_releasable.is_empty() {
+                    self.release_gallery_materials(&cover_releasable).await;
+                }
+                drop(cover_gate);
+            }
         } else if !markdown.trim().is_empty() {
-            delivered &= self
-                .send_message(event, markdown_payload(markdown, false))
-                .await;
-        } else if is_text_post {
-            delivered = false;
+            let payload = markdown_payload(markdown, cover_image.is_some());
+            match self.bot.reply(event, &payload).await {
+                Ok(_) => {
+                    sent_any = true;
+                    if !cover_releasable.is_empty() {
+                        self.release_gallery_materials(&cover_releasable).await;
+                    }
+                }
+                Err(error) => {
+                    warn!("QQ 消息发送失败: {error}");
+                    match error {
+                        QQBotError::Api(_) => {
+                            if !cover_releasable.is_empty() {
+                                self.release_gallery_materials(&cover_releasable).await;
+                            }
+                        }
+                        QQBotError::Other(_) => {
+                            if let Some(image) = &cover_image {
+                                let deadline = unix_now().unwrap_or(0).saturating_add(300);
+                                if let Err(err) = self.with_materials(|owned| {
+                                    owned.mark_due(std::slice::from_ref(&image.image_id), deadline)
+                                }) {
+                                    warn!("延后清理未确认封面素材的记录更新失败: {err}");
+                                }
+                            }
+                        }
+                    }
+                    delivered = false;
+                }
+            }
+            drop(cover_gate);
+        } else {
+            if !cover_releasable.is_empty() {
+                self.release_gallery_materials(&cover_releasable).await;
+            }
+            drop(cover_gate);
+            if is_text_post {
+                delivered = false;
+            }
         }
         if !video_file_info.is_empty() {
             let payload = media_payload(video_file_info);
-            delivered &= if x_reply_budget.is_some() {
+            let video_sent = if x_reply_budget.is_some() {
                 self.send_x_post_reply(event, payload).await
             } else {
                 self.send_message(event, payload).await
             };
+            if video_sent {
+                sent_any = true;
+            } else {
+                delivered = false;
+            }
         }
-        transfer_succeeded && delivered
+        transfer_succeeded && delivered && sent_any
     }
 
     pub async fn cleanup_markdown_materials(&self) {
@@ -2326,5 +2495,466 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn blacklist_load_failure_blocks_restricted_features_and_fails_startup_check() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = Arc::clone(&sent);
+        let app = Router::new()
+            .route(
+                "/app/getAppAccessToken",
+                post(|| async { Json(json!({"access_token":"BL_FAIL_TOKEN","expires_in":7200})) }),
+            )
+            .route(
+                "/v2/groups/{group}/messages",
+                post(move |Json(body): Json<Value>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured.lock().await.push(body);
+                        Json(json!({"id":"sent-bl-fail"}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let blacklist_file = temp_dir.path().join("broken-blacklist.json");
+        std::fs::write(&blacklist_file, b"{corrupt json").unwrap();
+
+        let mut config = AppConfig::default();
+        config.qqbot.app_id = "bot-app".into();
+        config.qqbot.app_secret = "bot-secret".into();
+        config.qqbot.api_base = base;
+        config.qqbot.super_admin_openid = "ADMIN_OPENID".into();
+        config.qqbot.blacklist_file = blacklist_file.to_string_lossy().into_owned();
+        config.gpt_detect.enabled = true;
+        config.output.temp_dir = temp_dir.path().to_string_lossy().into_owned();
+        let config = Arc::new(config);
+
+        // 1. Corrupt blacklist file fails startup check and blocks non-super-admin usage
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        ));
+        assert!(state.ensure_blacklist_ready().is_err());
+
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m-corrupt".into(),
+                sender_id: "USER_A".into(),
+                current_text: "ai吗".into(),
+                text: "ai吗".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert!(
+            sent.lock().await.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .contains("黑名单状态异常")
+        );
+
+        // Repairing the file allows automatic recovery without restarting
+        std::fs::write(&blacklist_file, br#"{"version":1,"entries":[]}"#).unwrap();
+        assert!(state.ensure_blacklist_ready().is_ok());
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m-recovered".into(),
+                sender_id: "USER_A".into(),
+                current_text: "ai吗".into(),
+                text: "ai吗".into(),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(
+            sent.lock().await.last().unwrap()["content"],
+            "请引用一张图片，然后精确回复“ai吗”。"
+        );
+
+        // 2. Unreadable blacklist file (Unix non-root) also fails startup check and blocks usage
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&blacklist_file, std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let is_unreadable = std::fs::File::open(&blacklist_file).is_err();
+            if is_unreadable {
+                let unreadable_state = Arc::new(AppState::new(
+                    Arc::clone(&config),
+                    Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+                    Arc::new(QQBotClient::new(config.qqbot.clone())),
+                ));
+                assert!(unreadable_state.ensure_blacklist_ready().is_err());
+                Arc::clone(&unreadable_state)
+                    .handle_message(QQChatEvent {
+                        chat_type: ChatType::Group,
+                        chat_id: "GROUP_1".into(),
+                        message_id: "m-unreadable".into(),
+                        sender_id: "USER_A".into(),
+                        current_text: "ai吗".into(),
+                        text: "ai吗".into(),
+                        ..QQChatEvent::default()
+                    })
+                    .await;
+                assert!(
+                    sent.lock().await.last().unwrap()["content"]
+                        .as_str()
+                        .unwrap()
+                        .contains("黑名单状态异常")
+                );
+            }
+            std::fs::set_permissions(&blacklist_file, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn quoted_old_blacklist_command_with_empty_current_text_does_not_modify_blacklist() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        let sent = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = Arc::clone(&sent);
+        let app = Router::new()
+            .route(
+                "/app/getAppAccessToken",
+                post(|| async { Json(json!({"access_token":"BL_QUOTE_TOKEN","expires_in":7200})) }),
+            )
+            .route(
+                "/v2/groups/{group}/messages",
+                post(move |Json(body): Json<Value>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured.lock().await.push(body);
+                        Json(json!({"id":"sent-bl-quote"}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.qqbot.app_id = "bot-app".into();
+        config.qqbot.app_secret = "bot-secret".into();
+        config.qqbot.api_base = base;
+        config.qqbot.super_admin_openid = "ADMIN_OPENID".into();
+        config.qqbot.show_waiting_tip = false;
+        config.output.temp_dir = temp_dir.path().to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        ));
+
+        // Admin quotes an old ban command without typing new text -> must NOT ban USER_A
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m-quoted-ban".into(),
+                sender_id: "ADMIN_OPENID".into(),
+                current_text: String::new(),
+                text: "拉黑<@USER_A> 误触引用".into(),
+                mentions: vec![crate::types::QQMention {
+                    id: "USER_A".into(),
+                    member_openid: "USER_A".into(),
+                    username: "无辜用户".into(),
+                    ..crate::types::QQMention::default()
+                }],
+                quoted_message_id: Some("OLD_BAN_MSG".into()),
+                quoted_text: Some("拉黑<@USER_A> 误触引用".into()),
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert!(sent.lock().await.is_empty());
+        assert!(
+            state
+                .with_blacklist(|store| Ok(store.reason("USER_A").map(ToString::to_string)))
+                .unwrap()
+                .is_none()
+        );
+
+        // Direct command in current_text still works
+        Arc::clone(&state)
+            .handle_message(QQChatEvent {
+                chat_type: ChatType::Group,
+                chat_id: "GROUP_1".into(),
+                message_id: "m-direct-ban".into(),
+                sender_id: "ADMIN_OPENID".into(),
+                current_text: "拉黑<@USER_A> 确认违规".into(),
+                text: "拉黑<@USER_A> 确认违规".into(),
+                mentions: vec![crate::types::QQMention {
+                    id: "USER_A".into(),
+                    member_openid: "USER_A".into(),
+                    username: "违规用户".into(),
+                    ..crate::types::QQMention::default()
+                }],
+                ..QQChatEvent::default()
+            })
+            .await;
+        assert_eq!(
+            state
+                .with_blacklist(|store| Ok(store.reason("USER_A").map(ToString::to_string)))
+                .unwrap()
+                .as_deref(),
+            Some("确认违规")
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn normal_video_honors_show_cover_and_marks_delivery_only_when_sent() {
+        use axum::{
+            Json, Router,
+            extract::Path as AxumPath,
+            http::header,
+            routing::{delete, get, post, put},
+        };
+        use serde_json::json;
+        use tokio::net::TcpListener;
+        use tokio::sync::Mutex;
+
+        // Minimal valid 2x2 PNG image for cover upload
+        let mut png_bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_bytes, 2, 2);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[255u8; 16]).unwrap();
+        }
+        let png_md5 = format!("{:x}", md5::compute(&png_bytes));
+        let png_bytes = Arc::new(png_bytes);
+        let sent_messages = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let deleted_materials = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let put_base = base.clone();
+        let cover_bytes = Arc::clone(&png_bytes);
+        let messages_store = Arc::clone(&sent_messages);
+        let deletions_store = Arc::clone(&deleted_materials);
+
+        let app = Router::new()
+            .route(
+                "/app/getAppAccessToken",
+                post(|| async { Json(json!({"access_token":"COVER_TOKEN","expires_in":7200})) }),
+            )
+            .route(
+                "/cover.png",
+                get(move || {
+                    let body = Arc::clone(&cover_bytes);
+                    async move { ([(header::CONTENT_TYPE, "image/png")], (*body).clone()) }
+                }),
+            )
+            .route(
+                "/v2/media-images/prepare",
+                post(move || {
+                    let put_url = format!("{put_base}/material-put/cover-1");
+                    async move {
+                        Json(json!({
+                            "upload_id": "cover-material-1",
+                            "presigned_url": put_url,
+                            "expires_in": 3600
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/material-put/{id}",
+                put(move || {
+                    let etag = format!("\"{png_md5}\"");
+                    async move { ([(header::ETAG, etag)], axum::http::StatusCode::OK) }
+                }),
+            )
+            .route(
+                "/v2/media-images/complete",
+                post(|| async {
+                    Json(json!({
+                        "image_id": "cover-material-1",
+                        "url": "qqbot-media://image/v1/cover-material-1",
+                        "ttl": 3600
+                    }))
+                }),
+            )
+            .route(
+                "/v2/media-images/{id}/delete",
+                delete(move |AxumPath(id): AxumPath<String>| {
+                    let deletions = Arc::clone(&deletions_store);
+                    async move {
+                        deletions.lock().await.push(id);
+                        Json(json!({}))
+                    }
+                }),
+            )
+            .route(
+                "/v2/groups/{group}/messages",
+                post(move |Json(body): Json<Value>| {
+                    let messages = Arc::clone(&messages_store);
+                    async move {
+                        messages.lock().await.push(body);
+                        Json(json!({"id":"sent-cover-1"}))
+                    }
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.qqbot.app_id = "app".into();
+        config.qqbot.app_secret = "secret".into();
+        config.qqbot.api_base = base.clone();
+        config.output.show_image_text = false;
+        config.output.show_cover = true;
+        config.output.show_video_file = false;
+        config.output.temp_dir = temp_dir.path().to_string_lossy().into_owned();
+        let config = Arc::new(config);
+        let state = AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        );
+
+        let event = QQChatEvent {
+            chat_type: ChatType::Group,
+            chat_id: "GROUP_COVER".into(),
+            message_id: "MSG_COVER_1".into(),
+            ..QQChatEvent::default()
+        };
+
+        // 1. Cover-only config with reachable cover sends cover markdown, deletes material, returns true
+        let mut parsed = ParsedData::empty("video");
+        parsed.video = format!("{base}/video.mp4");
+        parsed.cover = format!("{base}/cover.png");
+        assert!(
+            state
+                .send_media_result(&event, parsed, "ignored text".into(), 0)
+                .await
+        );
+        {
+            let messages = sent_messages.lock().await;
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["msg_type"], 2);
+            assert_eq!(messages[0]["markdown"]["force_verify_image_resource"], true);
+            assert!(
+                messages[0]["markdown"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("qqbot-media://image/v1/cover-material-1")
+            );
+        }
+        assert_eq!(
+            deleted_materials.lock().await.as_slice(),
+            &["cover-material-1".to_string()]
+        );
+
+        // 2. Cover-only config with missing cover sends nothing and returns false (must NOT mark delivered)
+        let mut no_cover = ParsedData::empty("video");
+        no_cover.video = format!("{base}/video.mp4");
+        assert!(
+            !state
+                .send_media_result(&event, no_cover, "ignored text".into(), 0)
+                .await
+        );
+        assert_eq!(sent_messages.lock().await.len(), 1);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn xiaohongshu_info_log_redacts_xsec_token_while_preserving_parser_url() {
+        use std::io::Write;
+        use std::sync::Mutex as StdMutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<StdMutex<Vec<u8>>>);
+        struct Guard(Arc<StdMutex<Vec<u8>>>);
+        impl Write for Guard {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = Guard;
+            fn make_writer(&'a self) -> Self::Writer {
+                Guard(Arc::clone(&self.0))
+            }
+        }
+
+        let synthetic_token = "SYNTHETIC_XSEC_TOKEN_DO_NOT_LOG";
+        let full_url = format!(
+            "https://www.xiaohongshu.com/explore/6acf1818000000000a0261e5?xsec_source=app_share&xsec_token={synthetic_token}"
+        );
+        // Verify matcher preserves the full URL with xsec_token for the parser
+        let matched = link_type_parser(&full_url);
+        assert_eq!(matched.len(), 1);
+        assert!(matched[0].url.contains(synthetic_token));
+
+        // Trigger the disabled-platform log path inside handle_message with a tracing capture
+        let logs = Arc::new(StdMutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(BufWriter(Arc::clone(&logs)))
+            .finish();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.output.temp_dir = temp_dir.path().to_string_lossy().into_owned();
+        config.platform_enable.insert("xiaohongshu".into(), false);
+        let config = Arc::new(config);
+        let state = Arc::new(AppState::new(
+            Arc::clone(&config),
+            Arc::new(VideoParserService::new((*config).clone()).unwrap()),
+            Arc::new(QQBotClient::new(config.qqbot.clone())),
+        ));
+        let event = QQChatEvent {
+            chat_type: ChatType::Group,
+            chat_id: "GROUP_LOG".into(),
+            message_id: "MSG_LOG_1".into(),
+            current_text: full_url.clone(),
+            text: full_url,
+            ..QQChatEvent::default()
+        };
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        state.handle_message(event).await;
+        drop(_guard);
+
+        let output = String::from_utf8_lossy(&logs.lock().unwrap()).to_string();
+        assert!(
+            output.contains("https://www.xiaohongshu.com/explore/6acf1818000000000a0261e5"),
+            "expected redacted URL in log output, got: {output}"
+        );
+        assert!(
+            !output.contains(synthetic_token),
+            "log output must not contain xsec_token, got: {output}"
+        );
     }
 }

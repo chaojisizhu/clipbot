@@ -17,7 +17,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::bot::message::{
     extract_card_fields, extract_current_text_from_qq_event, extract_quoted_content_from_qq_event,
-    extract_text_from_qq_event, strip_leading_self_mentions,
+    extract_text_from_qq_event, redact_urls_in_text, strip_leading_self_mentions,
 };
 use crate::types::{BotEvent, ChatType, QQApiError, QQBotConfig, QQChatEvent, QQMention};
 
@@ -728,12 +728,13 @@ impl QQBotClient {
                     fields
                         .iter()
                         .map(|(key, value)| {
+                            let raw = value
+                                .as_str()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| value.to_string());
                             format!(
                                 "{key}={}",
-                                value
-                                    .as_str()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_else(|| value.to_string())
+                                redact_urls_in_text(&raw)
                                     .chars()
                                     .take(200)
                                     .collect::<String>()

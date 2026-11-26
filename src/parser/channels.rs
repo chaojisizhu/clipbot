@@ -304,20 +304,81 @@ async fn fetch_feed_info(
     Ok(data)
 }
 
-fn stat_number(value: Option<&Value>) -> i64 {
-    value
-        .map(|value| {
-            let raw = match value {
-                Value::String(text) => text.clone(),
-                other => other.to_string(),
-            };
-            raw.chars()
-                .filter(|c| c.is_ascii_digit())
-                .collect::<String>()
-                .parse()
-                .unwrap_or(0)
-        })
-        .unwrap_or(0)
+fn parse_formatted_count(raw: &str) -> Option<i64> {
+    let cleaned = raw.trim().replace([',', '，', '+', '＋'], "");
+    if cleaned.is_empty() {
+        return None;
+    }
+    let trimmed = cleaned.trim();
+    let (number_part, multiplier) = if let Some(prefix) = trimmed.strip_suffix('亿') {
+        (prefix.trim(), 100_000_000.0)
+    } else if let Some(prefix) = trimmed
+        .strip_suffix('万')
+        .or_else(|| trimmed.strip_suffix('w'))
+        .or_else(|| trimmed.strip_suffix('W'))
+    {
+        (prefix.trim(), 10_000.0)
+    } else if let Some(prefix) = trimmed
+        .strip_suffix('千')
+        .or_else(|| trimmed.strip_suffix('k'))
+        .or_else(|| trimmed.strip_suffix('K'))
+    {
+        (prefix.trim(), 1_000.0)
+    } else if let Some(prefix) = trimmed
+        .strip_suffix('m')
+        .or_else(|| trimmed.strip_suffix('M'))
+    {
+        (prefix.trim(), 1_000_000.0)
+    } else {
+        (trimmed, 1.0)
+    };
+    if number_part.is_empty() {
+        return None;
+    }
+    if multiplier == 1.0
+        && number_part.bytes().all(|byte| byte.is_ascii_digit())
+        && let Ok(parsed) = number_part.parse::<i64>()
+    {
+        return Some(parsed);
+    }
+    let value: f64 = number_part.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let scaled = (value * multiplier).round();
+    if scaled > i64::MAX as f64 {
+        return None;
+    }
+    Some(scaled as i64)
+}
+
+fn stat_value(value: Option<&Value>) -> Option<i64> {
+    match value? {
+        Value::Number(number) => number
+            .as_i64()
+            .filter(|count| *count >= 0)
+            .or_else(|| number.as_u64().and_then(|count| i64::try_from(count).ok()))
+            .or_else(|| {
+                number
+                    .as_f64()
+                    .filter(|count| count.is_finite() && *count >= 0.0)
+                    .map(|count| count.round() as i64)
+            }),
+        Value::String(text) => parse_formatted_count(text),
+        _ => None,
+    }
+}
+
+fn stat_number(raw: Option<&Value>, fmt: Option<&Value>) -> i64 {
+    let raw_count = stat_value(raw);
+    let fmt_count = stat_value(fmt);
+    match (raw_count, fmt_count) {
+        (Some(count), _) if count > 0 => count,
+        (Some(0), Some(fmt)) if fmt > 0 => fmt,
+        (Some(count), _) => count,
+        (None, Some(fmt)) => fmt,
+        (None, None) => 0,
+    }
 }
 
 pub fn map_feed_to_parsed(feed: &Value) -> ParsedData {
@@ -358,17 +419,11 @@ pub fn map_feed_to_parsed(feed: &Value) -> ParsedData {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    parsed.like = stat_number(info.get("likeCountFmt").or_else(|| info.get("likeCount")));
-    parsed.comment = stat_number(
-        info.get("commentCountFmt")
-            .or_else(|| info.get("commentCount")),
-    );
-    parsed.share = stat_number(
-        info.get("forwardCountFmt")
-            .or_else(|| info.get("forwardCount")),
-    );
-    parsed.collect = stat_number(info.get("favCountFmt").or_else(|| info.get("favCount")));
-    parsed.play = stat_number(info.get("readCountFmt").or_else(|| info.get("readCount")));
+    parsed.like = stat_number(info.get("likeCount"), info.get("likeCountFmt"));
+    parsed.comment = stat_number(info.get("commentCount"), info.get("commentCountFmt"));
+    parsed.share = stat_number(info.get("forwardCount"), info.get("forwardCountFmt"));
+    parsed.collect = stat_number(info.get("favCount"), info.get("favCountFmt"));
+    parsed.play = stat_number(info.get("readCount"), info.get("readCountFmt"));
     let create_time = info
         .get("createtime")
         .or_else(|| info.get("createTime"))
@@ -652,5 +707,55 @@ mod tests {
         assert_eq!(parsed.video, "https://x/video.mp4");
         assert_eq!(parsed.like, 100);
         assert_eq!(parsed.collect, 50);
+    }
+
+    #[test]
+    fn prefers_raw_counts_and_parses_formatted_units() {
+        let both = serde_json::json!({
+            "errCode": 0,
+            "data": {
+                "feedInfo": {
+                    "description": "同时包含原始数值与展示文本",
+                    "likeCount": 12345,
+                    "likeCountFmt": "1.2万",
+                    "commentCount": 560,
+                    "commentCountFmt": "560",
+                    "forwardCount": 12000,
+                    "forwardCountFmt": "1.2万",
+                    "favCount": 3456,
+                    "favCountFmt": "3.5千",
+                    "readCount": 250000,
+                    "readCountFmt": "25万",
+                    "videoUrl": "https://x/video.mp4"
+                }
+            }
+        });
+        let parsed_both = map_feed_to_parsed(&both);
+        assert_eq!(parsed_both.like, 12_345);
+        assert_eq!(parsed_both.comment, 560);
+        assert_eq!(parsed_both.share, 12_000);
+        assert_eq!(parsed_both.collect, 3_456);
+        assert_eq!(parsed_both.play, 250_000);
+
+        let fmt_only = serde_json::json!({
+            "errCode": 0,
+            "data": {
+                "feedInfo": {
+                    "description": "仅有展示文本",
+                    "likeCountFmt": "1.2万",
+                    "commentCountFmt": "3.5千",
+                    "forwardCountFmt": "10万+",
+                    "favCountFmt": "1,234",
+                    "readCountFmt": "1.2亿",
+                    "videoUrl": "https://x/video.mp4"
+                }
+            }
+        });
+        let parsed_fmt = map_feed_to_parsed(&fmt_only);
+        assert_eq!(parsed_fmt.like, 12_000);
+        assert_eq!(parsed_fmt.comment, 3_500);
+        assert_eq!(parsed_fmt.share, 100_000);
+        assert_eq!(parsed_fmt.collect, 1_234);
+        assert_eq!(parsed_fmt.play, 120_000_000);
     }
 }

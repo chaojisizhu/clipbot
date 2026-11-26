@@ -26,7 +26,7 @@ WORKDIR /ffmpeg
 RUN curl --fail --location https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz -o source.tar.xz \
     && echo '8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e  source.tar.xz' | sha256sum -c - \
     && tar -xJf source.tar.xz --strip-components=1 \
-    && sed -i 's/-lx264/-l:libx264.a/' /usr/lib/x86_64-linux-gnu/pkgconfig/x264.pc \
+    && sed -i 's/-lx264/-l:libx264.a/' "$(pkg-config --variable=pcfiledir x264)/x264.pc" \
     && ./configure --disable-everything --disable-autodetect --disable-programs --enable-ffmpeg --enable-ffprobe \
        --enable-gpl --enable-version3 --enable-libx264 --pkg-config-flags=--static \
        --disable-doc --disable-debug --disable-x86asm --disable-shared --enable-static \
