@@ -7,6 +7,46 @@ import os
 import sys
 from importlib import import_module
 from threading import Lock
+from urllib.parse import urlsplit
+
+
+def attach_empty_chapter_retry(jmcomic, client):
+    """章节接口返回空图片列表时标记当前域名失败，触发轮询切换下一节点。"""
+    if not hasattr(client, "API_CHAPTER"):
+        return client
+
+    domains = getattr(client, "domain_list", None) or ()
+    if domains and getattr(client, "retry_times", 0) < len(domains):
+        client.retry_times = len(domains)
+
+    orig_check = client.raise_if_resp_should_retry
+
+    def checked_raise_if_resp_should_retry(resp, is_image):
+        resp = orig_check(resp, is_image)
+        if is_image or isinstance(resp, jmcomic.JmResp):
+            return resp
+        request = getattr(resp, "request", None)
+        url = getattr(request, "url", "") or ""
+        if urlsplit(url).path != client.API_CHAPTER:
+            return resp
+        headers = getattr(request, "headers", None) or {}
+        tokenparam = headers.get("tokenparam") or headers.get("Tokenparam") or ""
+        ts = tokenparam.split(",", 1)[0]
+        if not ts:
+            return resp
+        api_resp = jmcomic.JmApiResp(resp, ts)
+        if getattr(resp, "status_code", None) != 200 or api_resp.json().get("code") != 200:
+            return resp
+        data = api_resp.res_data
+        if isinstance(data, dict) and not data.get("images"):
+            jmcomic.ExceptionTool.raises_resp(
+                f"章节接口返回空图片列表: [{url}]",
+                resp,
+            )
+        return resp
+
+    client.raise_if_resp_should_retry = checked_raise_if_resp_should_retry
+    return client
 
 
 def create_downloader(jmcomic, option, max_pages):
@@ -15,6 +55,9 @@ def create_downloader(jmcomic, option, max_pages):
             self.remaining_pages = max_pages if max_pages > 0 else None
             self.page_lock = Lock()
             super().__init__(option)
+
+        def create_client(self):
+            return attach_empty_chapter_retry(jmcomic, super().create_client())
 
         def do_filter(self, detail):
             if not detail.is_photo() or self.remaining_pages is None:
@@ -98,6 +141,9 @@ def main():
         for f in files:
             if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
                 count += 1
+    if count == 0:
+        print(f"JM_ERR 下载失败: 本子 {args.target_id} 未下载到任何图片", file=sys.stderr)
+        sys.exit(4)
     print(f"JM_OK {count}")
     sys.exit(0)
 
